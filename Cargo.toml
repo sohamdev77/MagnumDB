@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["MagnumDB Contributors"]
 description = "A modern open-source embedded database engine"
 license = "MIT"
-repository = "https://github.com/example/magnumdb"
+repository = "https://github.com/sohamdev77/MagnumDB"
 
 [dependencies]
 # Error handling
