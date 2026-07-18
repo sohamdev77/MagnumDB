@@ -160,10 +160,7 @@ A: MagnumDB aims to provide similar embedded capabilities but focuses heavily on
 **Q: Why Rust?**  
 A: Rust provides the necessary control over memory and hardware to build a high-performance database while eliminating entire classes of memory safety bugs.
 
-## Screenshots
 
-![Shell Screenshot](https://via.placeholder.com/800x400?text=Interactive+Shell+Screenshot)
-*(Placeholder for Interactive Shell Screenshot)*
 
 ## License
 
