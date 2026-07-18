@@ -27,7 +27,7 @@ impl Database {
             std::fs::create_dir_all(&config.storage.path)?;
         }
 
-        let wal = if config.wal.enabled {
+        let mut wal = if config.wal.enabled {
             Some(WriteAheadLog::open(&config.storage.path)?)
         } else {
             None
@@ -37,7 +37,22 @@ impl Database {
         let pager = Pager::open(&data_path)?;
         
         let buffer_pool = BufferPool::new(pager, 1024);
-        let index = BTree::new(buffer_pool)?;
+        let mut index = BTree::new(buffer_pool)?;
+
+        // Perform WAL Recovery if enabled
+        if let Some(wal_ref) = &mut wal {
+            let entries = wal_ref.recover()?;
+            for entry in entries {
+                match entry {
+                    crate::wal::WalEntry::Put(k, v) => {
+                        index.insert(&k, &v)?;
+                    }
+                    crate::wal::WalEntry::Delete(k) => {
+                        index.delete(&k)?;
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             config,
