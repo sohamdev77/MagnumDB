@@ -13,7 +13,7 @@ Currently, MagnumDB is in active development (pre-1.0). Only the latest `main` b
 
 Please do **not** report security vulnerabilities via public GitHub issues.
 
-If you believe you have found a security vulnerability in MagnumDB, please report it to us by emailing `security@example.com` (placeholder email). We will investigate all reports and do our best to quickly fix the problem.
+If you believe you have found a security vulnerability in MagnumDB, please report it to us by emailing `support@blobly.in`. We will investigate all reports and do our best to quickly fix the problem.
 
 Please include the following information in your report:
 - Type of issue (e.g., buffer overflow, SQL injection, bypass).

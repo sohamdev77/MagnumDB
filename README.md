@@ -2,12 +2,12 @@
 
 > Modern Open Source Embedded Database Engine
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/example/magnumdb/ci.yml?branch=main)](https://github.com/example/magnumdb/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/sohamdev77/MagnumDB/ci.yml?branch=main)](https://github.com/sohamdev77/MagnumDB/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust Version](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org/)
 [![Crates.io Version](https://img.shields.io/crates/v/magnumdb.svg)](https://crates.io/crates/magnumdb)
-[![GitHub stars](https://img.shields.io/github/stars/example/magnumdb.svg)](https://github.com/example/magnumdb/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/example/magnumdb.svg)](https://github.com/example/magnumdb/issues)
+[![GitHub stars](https://img.shields.io/github/stars/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/issues)
 
 MagnumDB is a production-quality, open-source embedded database engine written in Rust. Designed to be both a high-performance database for real-world applications and a world-class educational resource for teaching database internals.
 
