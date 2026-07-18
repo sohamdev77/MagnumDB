@@ -1,0 +1,40 @@
+[package]
+name = "magnumdb"
+version = "0.1.0"
+edition = "2021"
+authors = ["MagnumDB Contributors"]
+description = "A modern open-source embedded database engine"
+license = "MIT"
+repository = "https://github.com/example/magnumdb"
+
+[dependencies]
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serialization and config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Fast, non-cryptographic hash function for internal structures
+ahash = "0.8"
+
+# Concurrency primitives
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+lru = "0.18.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+criterion = "0.5"
+
+[[bench]]
+name = "storage_bench"
+harness = false
