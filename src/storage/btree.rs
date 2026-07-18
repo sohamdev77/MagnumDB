@@ -427,10 +427,112 @@ impl BTree {
     }
 
     /// Deletes a key from the BTree.
-    pub fn delete(&mut self, _key: &[u8]) -> anyhow::Result<()> {
-        // TODO: Full delete implementation with merging
-        // Deletions are typically complex in B+ Trees. For now, we will leave records as is
-        // or just implement simple deletion without rebalancing for Phase 2.
+    pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
+        let root_node = self.read_node(self.root_page_id)?;
+        let (leaf_id, mut leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+
+        if let Ok(pos) = leaf_node.records.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+            leaf_node.records.remove(pos);
+            self.write_node(leaf_id, &Node::Leaf(leaf_node))?;
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::pager::Pager;
+    use tempfile::NamedTempFile;
+    use std::collections::BTreeMap;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+
+    fn setup_btree() -> BTree {
+        let temp_file = NamedTempFile::new().unwrap();
+        let pager = Pager::open(temp_file.path()).unwrap();
+        let buffer_pool = BufferPool::new(pager, 100);
+        BTree::new(buffer_pool).unwrap()
+    }
+
+    #[test]
+    fn test_btree_insert_get_delete() {
+        let mut btree = setup_btree();
+        
+        // Insert
+        btree.insert(b"key1", b"value1").unwrap();
+        btree.insert(b"key2", b"value2").unwrap();
+        
+        // Get
+        assert_eq!(btree.search(b"key1").unwrap().unwrap(), b"value1");
+        assert_eq!(btree.search(b"key2").unwrap().unwrap(), b"value2");
+        assert!(btree.search(b"key3").unwrap().is_none());
+        
+        // Delete
+        btree.delete(b"key1").unwrap();
+        assert!(btree.search(b"key1").unwrap().is_none());
+        assert_eq!(btree.search(b"key2").unwrap().unwrap(), b"value2");
+    }
+
+    #[test]
+    fn test_btree_split_behavior() {
+        let mut btree = setup_btree();
+        
+        // Insert enough records to force a leaf split.
+        // A page is 4096 bytes. Each record here is ~20 bytes. 
+        // 300 records = 6000 bytes, which forces a split.
+        for i in 0..300 {
+            let key = format!("key{:03}", i);
+            let val = format!("val{:03}", i);
+            btree.insert(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+
+        // Verify all records exist
+        for i in 0..300 {
+            let key = format!("key{:03}", i);
+            let val = format!("val{:03}", i);
+            assert_eq!(btree.search(key.as_bytes()).unwrap().unwrap(), val.as_bytes());
+        }
+        
+        // Ensure root is an internal node now
+        let root = btree.read_node(btree.root_page_id).unwrap();
+        assert!(matches!(root, Node::Internal(_)));
+    }
+
+    #[test]
+    fn test_btree_randomized_sequence() {
+        let mut btree = setup_btree();
+        let mut ref_map = BTreeMap::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        for _ in 0..1000 {
+            let op = rng.gen_range(0..100);
+            let key = format!("k{}", rng.gen_range(0..200));
+            
+            if op < 70 {
+                // 70% chance to insert
+                let val = format!("v{}", rng.gen_range(0..1000));
+                btree.insert(key.as_bytes(), val.as_bytes()).unwrap();
+                ref_map.insert(key, val);
+            } else if op < 85 {
+                // 15% chance to delete
+                btree.delete(key.as_bytes()).unwrap();
+                ref_map.remove(&key);
+            } else {
+                // 15% chance to get
+                let res = btree.search(key.as_bytes()).unwrap();
+                let ref_val = ref_map.get(&key);
+                match ref_val {
+                    Some(v) => assert_eq!(res.unwrap(), v.as_bytes()),
+                    None => assert!(res.is_none()),
+                }
+            }
+        }
+
+        // Final verification
+        for (k, v) in ref_map {
+            assert_eq!(btree.search(k.as_bytes()).unwrap().unwrap(), v.as_bytes());
+        }
     }
 }

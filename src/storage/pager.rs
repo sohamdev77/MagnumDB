@@ -89,3 +89,31 @@ impl Pager {
         self.file.sync_data()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_pager_round_trip() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut pager = Pager::open(temp_file.path()).unwrap();
+
+        assert_eq!(pager.num_pages, 0);
+
+        let page_id = pager.allocate_page().unwrap();
+        assert_eq!(page_id, 0);
+        assert_eq!(pager.num_pages, 1);
+
+        let mut page = Page::default();
+        page.data[0] = 42;
+        page.data[4095] = 99;
+
+        pager.write_page(page_id, &page).unwrap();
+
+        let read_page = pager.read_page(page_id).unwrap();
+        assert_eq!(read_page.data[0], 42);
+        assert_eq!(read_page.data[4095], 99);
+    }
+}

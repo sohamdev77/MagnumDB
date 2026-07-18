@@ -13,6 +13,9 @@ pub enum Statement {
     Select {
         table_name: String,
     },
+    Begin,
+    Commit,
+    Rollback,
 }
 
 pub struct Parser;
@@ -28,6 +31,12 @@ impl Parser {
             Self::parse_insert(sql)
         } else if upper_sql.starts_with("SELECT * FROM") {
             Self::parse_select(sql)
+        } else if upper_sql == "BEGIN" {
+            Ok(Statement::Begin)
+        } else if upper_sql == "COMMIT" {
+            Ok(Statement::Commit)
+        } else if upper_sql == "ROLLBACK" {
+            Ok(Statement::Rollback)
         } else {
             Err(anyhow!("Syntax Error: Unrecognized statement"))
         }
@@ -90,5 +99,52 @@ impl Parser {
         // e.g. SELECT * FROM users
         let table_name = sql[13..].trim().to_string();
         Ok(Statement::Select { table_name })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_create_table() {
+        let stmt = Parser::parse("CREATE TABLE users(id INT, name TEXT)").unwrap();
+        assert_eq!(stmt, Statement::CreateTable {
+            table_name: "users".to_string(),
+            columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+        });
+    }
+
+    #[test]
+    fn test_parse_insert() {
+        let stmt = Parser::parse("INSERT INTO users VALUES(1, 'Alice')").unwrap();
+        assert_eq!(stmt, Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["1".to_string(), "Alice".to_string()],
+        });
+    }
+
+    #[test]
+    fn test_parse_select() {
+        let stmt = Parser::parse("SELECT * FROM users;").unwrap();
+        assert_eq!(stmt, Statement::Select {
+            table_name: "users".to_string(),
+        });
+    }
+
+    #[test]
+    fn test_parse_transactions() {
+        assert_eq!(Parser::parse("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(Parser::parse("COMMIT").unwrap(), Statement::Commit);
+        assert_eq!(Parser::parse("ROLLBACK;").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn test_parse_malformed_statement() {
+        let err = Parser::parse("CREATE TABEL users(id INT)").unwrap_err();
+        assert_eq!(err.to_string(), "Syntax Error: Unrecognized statement");
+
+        let err = Parser::parse("CREATE TABLE users").unwrap_err();
+        assert_eq!(err.to_string(), "Syntax Error: Missing column definitions");
     }
 }

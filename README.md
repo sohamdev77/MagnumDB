@@ -14,7 +14,7 @@ MagnumDB is a production-quality, open-source embedded database engine written i
 ## Features
 
 - **Embedded & Fast**: Runs directly within your application with zero network overhead.
-- **ACID Transactions**: Full compliance with multi-version concurrency control (MVCC).
+- **ACID Transactions**: Single-writer transactions with WAL-backed durability.
 - **Crash Recovery**: Write-Ahead Log (WAL) ensures durability and consistency.
 - **B+ Tree Indexing**: Efficient storage and retrieval mechanism.
 - **SQL Support**: Built-in SQL parser (Phase 3).
@@ -130,11 +130,11 @@ magnum> SELECT * FROM users;
 
 - **Throughput**: > 100K reads/sec, > 50K writes/sec on commodity SSDs.
 - **Latency**: Sub-millisecond read/write latency.
-- **Concurrency**: Lock-free reads via MVCC.
+- **Concurrency**: Single-writer, multi-reader (SWMR) locking using `parking_lot`.
 
 ## Benchmarks
 
-See the [benchmarks/](benchmarks/) directory for reproducible performance test suites.
+
 
 ## Roadmap
 
@@ -155,7 +155,7 @@ We welcome contributions of all sizes! MagnumDB is specifically designed to be b
 ## FAQ
 
 **Q: Is MagnumDB a drop-in replacement for SQLite?**  
-A: MagnumDB aims to provide similar embedded capabilities but focuses heavily on its specific MVCC and networking roadmap. It is not currently a wire-compatible or API-compatible drop-in replacement.
+A: MagnumDB aims to provide similar embedded capabilities but focuses heavily on its specific educational and transactional roadmap. It is not currently a wire-compatible or API-compatible drop-in replacement.
 
 **Q: Why Rust?**  
 A: Rust provides the necessary control over memory and hardware to build a high-performance database while eliminating entire classes of memory safety bugs.
