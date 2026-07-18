@@ -22,8 +22,23 @@ MagnumDB is a production-quality, open-source embedded database engine written i
 
 ## Architecture
 
-![Architecture Diagram](https://via.placeholder.com/800x400?text=MagnumDB+Architecture+Diagram)
-*(Placeholder for Architecture Diagram)*
+```mermaid
+graph TD
+    A[Client / magnum shell] -->|SQL Query| B(SQL Parser)
+    B -->|AST| C(Query Executor)
+    
+    C -->|Reads/Writes| D[B+ Tree Index]
+    C -->|Logs| E[(WAL - Write Ahead Log)]
+    
+    D -->|Request Page| F(Buffer Pool Manager)
+    F -->|Evict/Load 4KB Pages| G[(Disk / Pager)]
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+    style F fill:#bbf,stroke:#333,stroke-width:2px
+    style G fill:#dfd,stroke:#333,stroke-width:2px
+    style E fill:#dfd,stroke:#333,stroke-width:2px
+```
 
 MagnumDB is built with a clean, layered architecture separating the storage engine, transaction manager, and query execution. See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive.
 
