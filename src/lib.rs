@@ -6,5 +6,4 @@ pub mod sql;
 
 // Common exports
 pub use config::Config;
-// We will export more structures as we build them, e.g.
-// pub use storage::Database;
+pub use storage::Database;

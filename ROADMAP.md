@@ -43,3 +43,6 @@ This document outlines the planned feature phases for MagnumDB. We aim to build 
 - [ ] REST API
 - [ ] gRPC API
 - [ ] Metrics Dashboard
+
+## Known Limitations
+- B-Tree deletions currently do not rebalance or merge underflowing pages. Pages are left under-filled, which may result in a larger file size than necessary. This is a known limitation that will be addressed in future phases.

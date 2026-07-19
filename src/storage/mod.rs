@@ -96,4 +96,75 @@ impl Database {
         self.index.delete(key)?;
         Ok(())
     }
+
+    /// Closes the database gracefully by flushing the buffer pool and checkpointing the WAL.
+    pub fn close(mut self) -> anyhow::Result<()> {
+        self.index.flush_all()?;
+        self.index.sync()?;
+        if let Some(wal) = &mut self.wal {
+            wal.checkpoint()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn get_config(path: std::path::PathBuf, wal_enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.storage.path = path;
+        config.wal.enabled = wal_enabled;
+        config
+    }
+
+    #[test]
+    fn test_database_close_wal_disabled() {
+        let dir = tempdir().unwrap();
+        let config = get_config(dir.path().to_path_buf(), false);
+        
+        {
+            let mut db = Database::open(config.clone()).unwrap();
+            db.put(b"hello", b"world").unwrap();
+            db.close().unwrap(); // Should flush data to btree pages
+        }
+        
+        {
+            let mut db = Database::open(config).unwrap();
+            let val = db.get(b"hello").unwrap().unwrap();
+            assert_eq!(val, b"world");
+        }
+    }
+
+    #[test]
+    fn test_database_wal_checkpoint() {
+        let dir = tempdir().unwrap();
+        let config = get_config(dir.path().to_path_buf(), true);
+        let wal_path = config.storage.path.join("magnum.wal");
+        
+        {
+            let mut db = Database::open(config.clone()).unwrap();
+            for i in 0..100 {
+                let k = format!("k{}", i);
+                let v = format!("v{}", i);
+                db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            }
+            db.close().unwrap(); // Should checkpoint WAL (truncate)
+        }
+        
+        // After close, WAL file size should be 0 (checkpointed)
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        
+        {
+            let mut db = Database::open(config).unwrap();
+            for i in 0..100 {
+                let k = format!("k{}", i);
+                let v = format!("v{}", i);
+                let val = db.get(k.as_bytes()).unwrap().unwrap();
+                assert_eq!(val, v.as_bytes());
+            }
+        }
+    }
 }

@@ -108,4 +108,11 @@ impl WriteAheadLog {
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_data()
     }
+
+    /// Checkpoints the WAL by clearing all entries.
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_data()
+    }
 }

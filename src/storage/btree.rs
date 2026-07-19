@@ -8,6 +8,9 @@ use super::buffer_pool::BufferPool;
 const NODE_TYPE_LEAF: u8 = 0;
 const NODE_TYPE_INTERNAL: u8 = 1;
 
+/// Maximum size of a key-value pair to fit in a page.
+pub const MAX_RECORD_SIZE: usize = 4000;
+
 /// In-memory representation of a B+ Tree node.
 #[derive(Debug, Clone)]
 pub enum Node {
@@ -191,22 +194,48 @@ pub struct BTree {
 impl BTree {
     pub fn new(mut buffer_pool: BufferPool) -> anyhow::Result<Self> {
         let root_page_id = if buffer_pool.get_num_pages() == 0 {
+            // Page 0: Metadata
+            let meta_id = buffer_pool.allocate_page()?;
+            // Page 1: Root leaf
             let new_page_id = buffer_pool.allocate_page()?;
+            
             let empty_leaf = Node::Leaf(LeafNode {
                 parent_page_id: None,
                 next_leaf: None,
                 records: Vec::new(),
             });
             buffer_pool.write_page(new_page_id, &empty_leaf.to_page())?;
+
+            // Write metadata
+            let mut meta_page = super::pager::Page::default();
+            meta_page.data[0..4].copy_from_slice(&new_page_id.to_le_bytes());
+            buffer_pool.write_page(meta_id, &meta_page)?;
+
             new_page_id
         } else {
-            0
+            let meta_page = buffer_pool.fetch_page(0)?;
+            u32::from_le_bytes(meta_page.data[0..4].try_into().unwrap())
         };
 
         Ok(Self {
             buffer_pool,
             root_page_id,
         })
+    }
+
+    fn persist_root_page_id(&mut self, root_page_id: PageId) -> anyhow::Result<()> {
+        let mut meta_page = self.buffer_pool.fetch_page(0)?;
+        meta_page.data[0..4].copy_from_slice(&root_page_id.to_le_bytes());
+        self.buffer_pool.write_page(0, &meta_page)?;
+        Ok(())
+    }
+
+    pub fn flush_all(&mut self) -> anyhow::Result<()> {
+        self.buffer_pool.flush_all()
+    }
+
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.buffer_pool.sync()
     }
 
     fn read_node(&mut self, page_id: PageId) -> anyhow::Result<Node> {
@@ -222,6 +251,10 @@ impl BTree {
 
     /// Inserts a key-value pair into the BTree.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        if key.len() + value.len() > MAX_RECORD_SIZE {
+            return Err(anyhow::anyhow!("Record size exceeds maximum allowed limit"));
+        }
+
         let root_node = self.read_node(self.root_page_id)?;
         
         let (leaf_id, mut leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
@@ -307,6 +340,7 @@ impl BTree {
             self.write_node(new_leaf_id, &right_leaf)?;
 
             self.root_page_id = new_root_id;
+            self.persist_root_page_id(new_root_id)?;
         }
 
         Ok(())
@@ -379,6 +413,7 @@ impl BTree {
             self.write_node(new_internal_id, &right_internal)?;
 
             self.root_page_id = new_root_id;
+            self.persist_root_page_id(new_root_id)?;
         }
 
         Ok(())
@@ -534,5 +569,49 @@ mod tests {
         for (k, v) in ref_map {
             assert_eq!(btree.search(k.as_bytes()).unwrap().unwrap(), v.as_bytes());
         }
+    }
+
+    #[test]
+    fn test_btree_root_persistence() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        
+        {
+            let pager = Pager::open(&path).unwrap();
+            let buffer_pool = BufferPool::new(pager, 100);
+            let mut btree = BTree::new(buffer_pool).unwrap();
+            
+            // Insert enough to split root
+            for i in 0..300 {
+                let key = format!("key{:03}", i);
+                let val = format!("val{:03}", i);
+                btree.insert(key.as_bytes(), val.as_bytes()).unwrap();
+            }
+            btree.flush_all().unwrap();
+            btree.sync().unwrap();
+        } // BTree closed
+
+        {
+            // Reopen and verify
+            let pager = Pager::open(&path).unwrap();
+            let buffer_pool = BufferPool::new(pager, 100);
+            let mut btree = BTree::new(buffer_pool).unwrap();
+            
+            for i in 0..300 {
+                let key = format!("key{:03}", i);
+                let val = format!("val{:03}", i);
+                assert_eq!(btree.search(key.as_bytes()).unwrap().unwrap(), val.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_oversized_record() {
+        let mut btree = setup_btree();
+        let key = b"large_key";
+        let val = vec![0u8; 4000]; // Too big
+        
+        let res = btree.insert(key, &val);
+        assert!(res.is_err());
     }
 }

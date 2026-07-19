@@ -87,6 +87,12 @@ impl BufferPool {
         
         Ok(())
     }
+
+    /// Syncs the pager to disk.
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.pager.sync()?;
+        Ok(())
+    }
     
     /// Returns the total number of allocated pages on disk.
     pub fn get_num_pages(&self) -> u32 {

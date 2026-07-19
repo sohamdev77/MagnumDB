@@ -3,6 +3,35 @@ use crate::storage::Database;
 use anyhow::Result;
 use std::collections::BTreeMap;
 
+fn encode_values(values: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for v in values {
+        let bytes = v.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    buf
+}
+
+fn decode_values(data: &[u8]) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        if offset + 4 > data.len() {
+            return Err(anyhow::anyhow!("Corrupted row encoding"));
+        }
+        let len = u32::from_le_bytes(data[offset..offset+4].try_into()?) as usize;
+        offset += 4;
+        if offset + len > data.len() {
+            return Err(anyhow::anyhow!("Corrupted row encoding"));
+        }
+        let s = String::from_utf8(data[offset..offset+len].to_vec())?;
+        offset += len;
+        values.push(s);
+    }
+    Ok(values)
+}
+
 pub struct Executor<'a> {
     db: &'a mut Database,
     in_transaction: bool,
@@ -90,7 +119,7 @@ impl<'a> Executor<'a> {
                 
                 let pk = &values[0];
                 let internal_key = format!("{}:{}", table_name, pk).into_bytes();
-                let internal_val = values.join(",").into_bytes();
+                let internal_val = encode_values(&values);
 
                 if self.in_transaction {
                     self.write_buffer.insert(internal_key, Some(internal_val));
@@ -136,8 +165,8 @@ impl<'a> Executor<'a> {
                 for (key, val) in records {
                     let k_str = String::from_utf8_lossy(&key);
                     if k_str.starts_with(&prefix) {
-                        let v_str = String::from_utf8_lossy(&val);
-                        let formatted_row = v_str.replace(",", " | ");
+                        let decoded = decode_values(&val)?;
+                        let formatted_row = decoded.join(" | ");
                         output.push_str(&format!("| {} |\n", formatted_row));
                         count += 1;
                     }
@@ -149,5 +178,44 @@ impl<'a> Executor<'a> {
                 Ok(output)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use tempfile::tempdir;
+
+    fn setup_db() -> Database {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.path = dir.path().to_path_buf();
+        config.wal.enabled = false;
+        Database::open(config).unwrap()
+    }
+
+    #[test]
+    fn test_executor_comma_delimiter() {
+        let mut db = setup_db();
+        let mut exec = Executor::new(&mut db);
+
+        // Create table
+        exec.execute(Statement::CreateTable {
+            table_name: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string(), "bio".to_string()],
+        }).unwrap();
+
+        // Insert row with comma
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["1".to_string(), "Alice".to_string(), "Hello, world!".to_string()],
+        }).unwrap();
+
+        // Select and assert roundtrip
+        let result = exec.execute(Statement::Select { table_name: "users".to_string() }).unwrap();
+        
+        assert!(result.contains("Hello, world!"));
+        assert!(!result.contains("Hello |  world!")); // Should not be replaced
     }
 }
