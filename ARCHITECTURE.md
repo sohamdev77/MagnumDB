@@ -6,20 +6,20 @@ This document describes the high-level architecture of MagnumDB.
 
 MagnumDB is an embedded, high-performance database written in Rust. It is designed to be highly modular. The system is split into several distinct layers:
 
-1. **Client / Network Layer (Phase 5+)**
+1. **Client / Network Layer**
    - Handles TCP connections, authentication, and wire protocols.
    - For embedded use, this layer is bypassed in favor of direct API calls.
 
-2. **SQL Parser & Query Engine (Phase 3)**
+2. **SQL Parser & Query Engine**
    - Parses SQL into Abstract Syntax Trees (AST).
    - Generates and optimizes execution plans.
 
-3. **Transaction Manager (Phase 4)**
+3. **Transaction Manager**
    - Manages ACID properties.
    - Implements Multi-Version Concurrency Control (MVCC).
    - Handles row-level and table-level locks.
 
-4. **Storage Engine (Phase 1-2)**
+4. **Storage Engine**
    - **Cache Manager:** Keeps frequently accessed data in RAM.
    - **B+ Tree Index:** Efficient structures for fast lookups.
    - **Key-Value Store:** The foundational storage API.

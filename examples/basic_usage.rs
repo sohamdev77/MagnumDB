@@ -1,4 +1,4 @@
-use magnumdb::{Database, Config};
+use magnumdb::{Config, Database};
 
 fn main() -> anyhow::Result<()> {
     let config = Config::default().with_path("./my_database");
@@ -9,6 +9,6 @@ fn main() -> anyhow::Result<()> {
 
     assert_eq!(val.unwrap(), b"world");
     println!("Basic usage complete! Data persisted to ./my_database");
-    
+
     Ok(())
 }

@@ -1,6 +1,6 @@
-use magnumdb::storage::Database;
 use magnumdb::config::Config;
-use magnumdb::sql::{Parser, Executor};
+use magnumdb::sql::{Executor, Parser};
+use magnumdb::storage::Database;
 use tempfile::tempdir;
 
 fn setup_executor(dir: &tempfile::TempDir) -> (Database, Config) {
@@ -51,24 +51,32 @@ fn test_transactions() {
 
     // 1. Rollback test
     exec.execute(Parser::parse("BEGIN").unwrap()).unwrap();
-    exec.execute(Parser::parse("INSERT INTO users VALUES(1, 'Alice')").unwrap()).unwrap();
-    
+    exec.execute(Parser::parse("INSERT INTO users VALUES(1, 'Alice')").unwrap())
+        .unwrap();
+
     // Verify it exists in current transaction context
-    let res = exec.execute(Parser::parse("SELECT * FROM users").unwrap()).unwrap();
+    let res = exec
+        .execute(Parser::parse("SELECT * FROM users").unwrap())
+        .unwrap();
     assert!(res.contains("Alice"));
-    
+
     // Rollback
     exec.execute(Parser::parse("ROLLBACK").unwrap()).unwrap();
-    
+
     // Verify it's gone
-    let res = exec.execute(Parser::parse("SELECT * FROM users").unwrap()).unwrap();
+    let res = exec
+        .execute(Parser::parse("SELECT * FROM users").unwrap())
+        .unwrap();
     assert!(!res.contains("Alice"));
 
     // 2. Commit test
     exec.execute(Parser::parse("BEGIN").unwrap()).unwrap();
-    exec.execute(Parser::parse("INSERT INTO users VALUES(2, 'Bob')").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO users VALUES(2, 'Bob')").unwrap())
+        .unwrap();
     exec.execute(Parser::parse("COMMIT").unwrap()).unwrap();
 
-    let res = exec.execute(Parser::parse("SELECT * FROM users").unwrap()).unwrap();
+    let res = exec
+        .execute(Parser::parse("SELECT * FROM users").unwrap())
+        .unwrap();
     assert!(res.contains("Bob"));
 }

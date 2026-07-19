@@ -1,5 +1,5 @@
-use magnumdb::{Database, Config};
-use magnumdb::sql::{Parser, Executor};
+use magnumdb::sql::{Executor, Parser};
+use magnumdb::{Config, Database};
 use std::io::{self, Write};
 
 fn main() -> anyhow::Result<()> {

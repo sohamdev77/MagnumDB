@@ -1,5 +1,5 @@
-use magnumdb::storage::Database;
 use magnumdb::config::Config;
+use magnumdb::storage::Database;
 use tempfile::tempdir;
 
 #[test]
@@ -10,7 +10,7 @@ fn test_wal_crash_recovery() {
     config.wal.enabled = true;
     config.wal.sync_on_write = true;
 
-    // Phase 1: Write and "Crash"
+    // Write some data and simulate a crash by dropping the DB without closing
     {
         let mut db = Database::open(config.clone()).expect("Failed to open db");
         db.put(b"key1", b"value1").unwrap();
@@ -20,10 +20,10 @@ fn test_wal_crash_recovery() {
         // in our implementation right now, so the data is only safely in the WAL.
     }
 
-    // Phase 2: Recover
+    // Recover from the WAL on restart
     {
         let mut db = Database::open(config.clone()).expect("Failed to recover db");
-        
+
         // key1 was updated
         assert_eq!(db.get(b"key1").unwrap(), Some(b"value1_updated".to_vec()));
         // key2 should exist

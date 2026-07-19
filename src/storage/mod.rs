@@ -2,15 +2,15 @@
 //!
 //! This module provides the core key-value storage capabilities.
 
-pub mod buffer_pool;
 pub mod btree;
+pub mod buffer_pool;
 pub mod pager;
 
 use crate::config::Config;
 use crate::wal::WriteAheadLog;
 use btree::BTree;
-use pager::Pager;
 use buffer_pool::BufferPool;
+use pager::Pager;
 
 /// The core Database structure.
 pub struct Database {
@@ -35,7 +35,7 @@ impl Database {
 
         let data_path = config.storage.path.join("magnum.data");
         let pager = Pager::open(&data_path)?;
-        
+
         let buffer_pool = BufferPool::new(pager, 1024);
         let mut index = BTree::new(buffer_pool)?;
 
@@ -54,11 +54,7 @@ impl Database {
             }
         }
 
-        Ok(Self {
-            config,
-            wal,
-            index,
-        })
+        Ok(Self { config, wal, index })
     }
 
     /// Inserts a key-value pair into the database.
@@ -69,7 +65,7 @@ impl Database {
                 wal.sync()?;
             }
         }
-        
+
         self.index.insert(key, value)?;
         Ok(())
     }
@@ -92,7 +88,7 @@ impl Database {
                 wal.sync()?;
             }
         }
-        
+
         self.index.delete(key)?;
         Ok(())
     }
@@ -124,13 +120,13 @@ mod tests {
     fn test_database_close_wal_disabled() {
         let dir = tempdir().unwrap();
         let config = get_config(dir.path().to_path_buf(), false);
-        
+
         {
             let mut db = Database::open(config.clone()).unwrap();
             db.put(b"hello", b"world").unwrap();
             db.close().unwrap(); // Should flush data to btree pages
         }
-        
+
         {
             let mut db = Database::open(config).unwrap();
             let val = db.get(b"hello").unwrap().unwrap();
@@ -143,7 +139,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = get_config(dir.path().to_path_buf(), true);
         let wal_path = config.storage.path.join("magnum.wal");
-        
+
         {
             let mut db = Database::open(config.clone()).unwrap();
             for i in 0..100 {
@@ -153,10 +149,10 @@ mod tests {
             }
             db.close().unwrap(); // Should checkpoint WAL (truncate)
         }
-        
+
         // After close, WAL file size should be 0 (checkpointed)
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
-        
+
         {
             let mut db = Database::open(config).unwrap();
             for i in 0..100 {

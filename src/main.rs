@@ -1,8 +1,8 @@
 use clap::Parser;
 use magnumdb::cli::{Cli, Commands};
 use magnumdb::config::Config;
+use magnumdb::sql::{Executor, Parser as SqlParser};
 use magnumdb::storage::Database;
-use magnumdb::sql::{Parser as SqlParser, Executor};
 use std::io::{self, Write};
 
 fn main() -> anyhow::Result<()> {
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
                 if input.is_empty() {
                     continue;
                 }
-                
+
                 if input.eq_ignore_ascii_case("exit;") || input.eq_ignore_ascii_case("quit;") {
                     break;
                 }

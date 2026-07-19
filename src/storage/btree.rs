@@ -2,8 +2,8 @@
 //!
 //! Provides the core indexing mechanism based on 4KB pages.
 
-use super::pager::{Page, PageId, PAGE_SIZE};
 use super::buffer_pool::BufferPool;
+use super::pager::{Page, PageId, PAGE_SIZE};
 
 const NODE_TYPE_LEAF: u8 = 0;
 const NODE_TYPE_INTERNAL: u8 = 1;
@@ -42,57 +42,57 @@ impl Node {
             Node::Leaf(leaf) => {
                 page.data[offset] = NODE_TYPE_LEAF;
                 offset += 1;
-                
+
                 let num_records = leaf.records.len() as u16;
-                page.data[offset..offset+2].copy_from_slice(&num_records.to_le_bytes());
+                page.data[offset..offset + 2].copy_from_slice(&num_records.to_le_bytes());
                 offset += 2;
 
                 let parent_id = leaf.parent_page_id.unwrap_or(u32::MAX);
-                page.data[offset..offset+4].copy_from_slice(&parent_id.to_le_bytes());
+                page.data[offset..offset + 4].copy_from_slice(&parent_id.to_le_bytes());
                 offset += 4;
 
                 let next_id = leaf.next_leaf.unwrap_or(u32::MAX);
-                page.data[offset..offset+4].copy_from_slice(&next_id.to_le_bytes());
+                page.data[offset..offset + 4].copy_from_slice(&next_id.to_le_bytes());
                 offset += 4;
 
                 for (key, val) in &leaf.records {
                     let klen = key.len() as u32;
-                    page.data[offset..offset+4].copy_from_slice(&klen.to_le_bytes());
+                    page.data[offset..offset + 4].copy_from_slice(&klen.to_le_bytes());
                     offset += 4;
-                    page.data[offset..offset+key.len()].copy_from_slice(key);
+                    page.data[offset..offset + key.len()].copy_from_slice(key);
                     offset += key.len();
 
                     let vlen = val.len() as u32;
-                    page.data[offset..offset+4].copy_from_slice(&vlen.to_le_bytes());
+                    page.data[offset..offset + 4].copy_from_slice(&vlen.to_le_bytes());
                     offset += 4;
-                    page.data[offset..offset+val.len()].copy_from_slice(val);
+                    page.data[offset..offset + val.len()].copy_from_slice(val);
                     offset += val.len();
                 }
             }
             Node::Internal(internal) => {
                 page.data[offset] = NODE_TYPE_INTERNAL;
                 offset += 1;
-                
+
                 let num_keys = internal.keys.len() as u16;
-                page.data[offset..offset+2].copy_from_slice(&num_keys.to_le_bytes());
+                page.data[offset..offset + 2].copy_from_slice(&num_keys.to_le_bytes());
                 offset += 2;
 
                 let parent_id = internal.parent_page_id.unwrap_or(u32::MAX);
-                page.data[offset..offset+4].copy_from_slice(&parent_id.to_le_bytes());
+                page.data[offset..offset + 4].copy_from_slice(&parent_id.to_le_bytes());
                 offset += 4;
 
                 // Write children (num_keys + 1)
                 for child in &internal.children {
-                    page.data[offset..offset+4].copy_from_slice(&child.to_le_bytes());
+                    page.data[offset..offset + 4].copy_from_slice(&child.to_le_bytes());
                     offset += 4;
                 }
 
                 // Write keys
                 for key in &internal.keys {
                     let klen = key.len() as u32;
-                    page.data[offset..offset+4].copy_from_slice(&klen.to_le_bytes());
+                    page.data[offset..offset + 4].copy_from_slice(&klen.to_le_bytes());
                     offset += 4;
-                    page.data[offset..offset+key.len()].copy_from_slice(key);
+                    page.data[offset..offset + key.len()].copy_from_slice(key);
                     offset += key.len();
                 }
             }
@@ -106,28 +106,30 @@ impl Node {
         let node_type = page.data[0];
         let mut offset = 1;
 
-        let num_elements = u16::from_le_bytes(page.data[offset..offset+2].try_into().unwrap());
+        let num_elements = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap());
         offset += 2;
 
-        let p_id = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap());
+        let p_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
         let parent_page_id = if p_id == u32::MAX { None } else { Some(p_id) };
         offset += 4;
 
         if node_type == NODE_TYPE_LEAF {
-            let n_id = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap());
+            let n_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
             let next_leaf = if n_id == u32::MAX { None } else { Some(n_id) };
             offset += 4;
 
             let mut records = Vec::new();
             for _ in 0..num_elements {
-                let klen = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap()) as usize;
+                let klen =
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
-                let key = page.data[offset..offset+klen].to_vec();
+                let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
 
-                let vlen = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap()) as usize;
+                let vlen =
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
-                let val = page.data[offset..offset+vlen].to_vec();
+                let val = page.data[offset..offset + vlen].to_vec();
                 offset += vlen;
 
                 records.push((key, val));
@@ -141,16 +143,17 @@ impl Node {
         } else {
             let mut children = Vec::new();
             for _ in 0..=num_elements {
-                let child = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap());
+                let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
                 offset += 4;
                 children.push(child);
             }
 
             let mut keys = Vec::new();
             for _ in 0..num_elements {
-                let klen = u32::from_le_bytes(page.data[offset..offset+4].try_into().unwrap()) as usize;
+                let klen =
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
-                let key = page.data[offset..offset+klen].to_vec();
+                let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
                 keys.push(key);
             }
@@ -198,7 +201,7 @@ impl BTree {
             let meta_id = buffer_pool.allocate_page()?;
             // Page 1: Root leaf
             let new_page_id = buffer_pool.allocate_page()?;
-            
+
             let empty_leaf = Node::Leaf(LeafNode {
                 parent_page_id: None,
                 next_leaf: None,
@@ -256,21 +259,27 @@ impl BTree {
         }
 
         let root_node = self.read_node(self.root_page_id)?;
-        
-        let (leaf_id, mut leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+
+        let (leaf_id, mut leaf_node) =
+            self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
 
         // Insert into the leaf node
-        let pos = leaf_node.records.binary_search_by(|(k, _)| k.as_slice().cmp(key)).unwrap_or_else(|e| e);
+        let pos = leaf_node
+            .records
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+            .unwrap_or_else(|e| e);
         if pos < leaf_node.records.len() && leaf_node.records[pos].0 == key {
             // Update existing
             leaf_node.records[pos].1 = value.to_vec();
         } else {
             // Insert new
-            leaf_node.records.insert(pos, (key.to_vec(), value.to_vec()));
+            leaf_node
+                .records
+                .insert(pos, (key.to_vec(), value.to_vec()));
         }
 
         let updated_leaf = Node::Leaf(leaf_node.clone());
-        
+
         if updated_leaf.encoded_size() > PAGE_SIZE {
             self.split_leaf_and_insert(leaf_id, leaf_node)?;
         } else {
@@ -280,7 +289,12 @@ impl BTree {
         Ok(())
     }
 
-    fn find_leaf_for_insert(&mut self, current_id: PageId, current_node: &Node, key: &[u8]) -> anyhow::Result<(PageId, LeafNode)> {
+    fn find_leaf_for_insert(
+        &mut self,
+        current_id: PageId,
+        current_node: &Node,
+        key: &[u8],
+    ) -> anyhow::Result<(PageId, LeafNode)> {
         match current_node {
             Node::Leaf(leaf) => Ok((current_id, leaf.clone())),
             Node::Internal(internal) => {
@@ -298,7 +312,11 @@ impl BTree {
         }
     }
 
-    fn split_leaf_and_insert(&mut self, leaf_id: PageId, mut leaf_node: LeafNode) -> anyhow::Result<()> {
+    fn split_leaf_and_insert(
+        &mut self,
+        leaf_id: PageId,
+        mut leaf_node: LeafNode,
+    ) -> anyhow::Result<()> {
         // Split records in half
         let mid = leaf_node.records.len() / 2;
         let right_records = leaf_node.records.split_off(mid);
@@ -327,7 +345,7 @@ impl BTree {
                 children: vec![leaf_id, new_leaf_id],
             };
             self.write_node(new_root_id, &Node::Internal(new_root_node))?;
-            
+
             // Update children's parent pointers
             let mut left_leaf = leaf_node;
             left_leaf.parent_page_id = Some(new_root_id);
@@ -346,7 +364,12 @@ impl BTree {
         Ok(())
     }
 
-    fn insert_into_internal(&mut self, parent_id: PageId, key: Vec<u8>, right_child_id: PageId) -> anyhow::Result<()> {
+    fn insert_into_internal(
+        &mut self,
+        parent_id: PageId,
+        key: Vec<u8>,
+        right_child_id: PageId,
+    ) -> anyhow::Result<()> {
         let parent_node = self.read_node(parent_id)?;
         if let Node::Internal(mut internal) = parent_node {
             let pos = internal.keys.binary_search(&key).unwrap_or_else(|e| e);
@@ -363,7 +386,11 @@ impl BTree {
         Ok(())
     }
 
-    fn split_internal_and_insert(&mut self, internal_id: PageId, mut internal_node: InternalNode) -> anyhow::Result<()> {
+    fn split_internal_and_insert(
+        &mut self,
+        internal_id: PageId,
+        mut internal_node: InternalNode,
+    ) -> anyhow::Result<()> {
         let mid = internal_node.keys.len() / 2;
         let push_up_key = internal_node.keys.remove(mid);
         let right_keys = internal_node.keys.split_off(mid);
@@ -400,7 +427,7 @@ impl BTree {
                 children: vec![internal_id, new_internal_id],
             };
             self.write_node(new_root_id, &Node::Internal(new_root_node))?;
-            
+
             // Update children's parent pointers
             let mut left_internal = internal_node;
             left_internal.parent_page_id = Some(new_root_id);
@@ -424,7 +451,10 @@ impl BTree {
         let root_node = self.read_node(self.root_page_id)?;
         let (_, leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
 
-        if let Ok(pos) = leaf_node.records.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+        if let Ok(pos) = leaf_node
+            .records
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+        {
             Ok(Some(leaf_node.records[pos].1.clone()))
         } else {
             Ok(None)
@@ -434,7 +464,7 @@ impl BTree {
     /// Scans all records in the BTree (table scan).
     pub fn scan(&mut self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
-        
+
         // Find leftmost leaf
         let mut current_id = self.root_page_id;
         let mut current_node = self.read_node(current_id)?;
@@ -464,9 +494,13 @@ impl BTree {
     /// Deletes a key from the BTree.
     pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
         let root_node = self.read_node(self.root_page_id)?;
-        let (leaf_id, mut leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+        let (leaf_id, mut leaf_node) =
+            self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
 
-        if let Ok(pos) = leaf_node.records.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+        if let Ok(pos) = leaf_node
+            .records
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+        {
             leaf_node.records.remove(pos);
             self.write_node(leaf_id, &Node::Leaf(leaf_node))?;
         }
@@ -479,10 +513,10 @@ impl BTree {
 mod tests {
     use super::*;
     use crate::storage::pager::Pager;
-    use tempfile::NamedTempFile;
-    use std::collections::BTreeMap;
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use std::collections::BTreeMap;
+    use tempfile::NamedTempFile;
 
     fn setup_btree() -> BTree {
         let temp_file = NamedTempFile::new().unwrap();
@@ -494,16 +528,16 @@ mod tests {
     #[test]
     fn test_btree_insert_get_delete() {
         let mut btree = setup_btree();
-        
+
         // Insert
         btree.insert(b"key1", b"value1").unwrap();
         btree.insert(b"key2", b"value2").unwrap();
-        
+
         // Get
         assert_eq!(btree.search(b"key1").unwrap().unwrap(), b"value1");
         assert_eq!(btree.search(b"key2").unwrap().unwrap(), b"value2");
         assert!(btree.search(b"key3").unwrap().is_none());
-        
+
         // Delete
         btree.delete(b"key1").unwrap();
         assert!(btree.search(b"key1").unwrap().is_none());
@@ -513,9 +547,9 @@ mod tests {
     #[test]
     fn test_btree_split_behavior() {
         let mut btree = setup_btree();
-        
+
         // Insert enough records to force a leaf split.
-        // A page is 4096 bytes. Each record here is ~20 bytes. 
+        // A page is 4096 bytes. Each record here is ~20 bytes.
         // 300 records = 6000 bytes, which forces a split.
         for i in 0..300 {
             let key = format!("key{:03}", i);
@@ -527,9 +561,12 @@ mod tests {
         for i in 0..300 {
             let key = format!("key{:03}", i);
             let val = format!("val{:03}", i);
-            assert_eq!(btree.search(key.as_bytes()).unwrap().unwrap(), val.as_bytes());
+            assert_eq!(
+                btree.search(key.as_bytes()).unwrap().unwrap(),
+                val.as_bytes()
+            );
         }
-        
+
         // Ensure root is an internal node now
         let root = btree.read_node(btree.root_page_id).unwrap();
         assert!(matches!(root, Node::Internal(_)));
@@ -544,7 +581,7 @@ mod tests {
         for _ in 0..1000 {
             let op = rng.gen_range(0..100);
             let key = format!("k{}", rng.gen_range(0..200));
-            
+
             if op < 70 {
                 // 70% chance to insert
                 let val = format!("v{}", rng.gen_range(0..1000));
@@ -575,12 +612,12 @@ mod tests {
     fn test_btree_root_persistence() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         {
             let pager = Pager::open(&path).unwrap();
             let buffer_pool = BufferPool::new(pager, 100);
             let mut btree = BTree::new(buffer_pool).unwrap();
-            
+
             // Insert enough to split root
             for i in 0..300 {
                 let key = format!("key{:03}", i);
@@ -596,11 +633,14 @@ mod tests {
             let pager = Pager::open(&path).unwrap();
             let buffer_pool = BufferPool::new(pager, 100);
             let mut btree = BTree::new(buffer_pool).unwrap();
-            
+
             for i in 0..300 {
                 let key = format!("key{:03}", i);
                 let val = format!("val{:03}", i);
-                assert_eq!(btree.search(key.as_bytes()).unwrap().unwrap(), val.as_bytes());
+                assert_eq!(
+                    btree.search(key.as_bytes()).unwrap().unwrap(),
+                    val.as_bytes()
+                );
             }
         }
     }
@@ -610,7 +650,7 @@ mod tests {
         let mut btree = setup_btree();
         let key = b"large_key";
         let val = vec![0u8; 4000]; // Too big
-        
+
         let res = btree.insert(key, &val);
         assert!(res.is_err());
     }

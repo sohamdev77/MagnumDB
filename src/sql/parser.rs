@@ -48,7 +48,7 @@ impl Parser {
         if parts.len() < 3 {
             return Err(anyhow!("Syntax Error: Invalid CREATE TABLE syntax"));
         }
-        
+
         // table_name could have the '(' right next to it: users(id...
         let table_and_cols = parts[2];
         let table_name;
@@ -62,9 +62,7 @@ impl Parser {
             return Err(anyhow!("Syntax Error: Missing column definitions"));
         }
 
-        let columns = cols_str.split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        let columns = cols_str.split(',').map(|s| s.trim().to_string()).collect();
 
         Ok(Statement::CreateTable {
             table_name,
@@ -75,17 +73,22 @@ impl Parser {
     fn parse_insert(sql: &str) -> Result<Statement> {
         // e.g. INSERT INTO users VALUES(1, 'Soham')
         let upper_sql = sql.to_uppercase();
-        let values_idx = upper_sql.find("VALUES").ok_or(anyhow!("Syntax Error: Missing VALUES keyword"))?;
-        
+        let values_idx = upper_sql
+            .find("VALUES")
+            .ok_or(anyhow!("Syntax Error: Missing VALUES keyword"))?;
+
         let table_name_part = sql[11..values_idx].trim();
         let values_part = sql[values_idx + 6..].trim();
 
         if !values_part.starts_with('(') || !values_part.ends_with(')') {
-            return Err(anyhow!("Syntax Error: VALUES must be enclosed in parentheses"));
+            return Err(anyhow!(
+                "Syntax Error: VALUES must be enclosed in parentheses"
+            ));
         }
 
         let inner_vals = &values_part[1..values_part.len() - 1];
-        let values = inner_vals.split(',')
+        let values = inner_vals
+            .split(',')
             .map(|s| s.trim().trim_matches('\'').to_string())
             .collect();
 
@@ -109,27 +112,36 @@ mod tests {
     #[test]
     fn test_parse_create_table() {
         let stmt = Parser::parse("CREATE TABLE users(id INT, name TEXT)").unwrap();
-        assert_eq!(stmt, Statement::CreateTable {
-            table_name: "users".to_string(),
-            columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-        });
+        assert_eq!(
+            stmt,
+            Statement::CreateTable {
+                table_name: "users".to_string(),
+                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+            }
+        );
     }
 
     #[test]
     fn test_parse_insert() {
         let stmt = Parser::parse("INSERT INTO users VALUES(1, 'Alice')").unwrap();
-        assert_eq!(stmt, Statement::Insert {
-            table_name: "users".to_string(),
-            values: vec!["1".to_string(), "Alice".to_string()],
-        });
+        assert_eq!(
+            stmt,
+            Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["1".to_string(), "Alice".to_string()],
+            }
+        );
     }
 
     #[test]
     fn test_parse_select() {
         let stmt = Parser::parse("SELECT * FROM users;").unwrap();
-        assert_eq!(stmt, Statement::Select {
-            table_name: "users".to_string(),
-        });
+        assert_eq!(
+            stmt,
+            Statement::Select {
+                table_name: "users".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -20,12 +20,12 @@ fn decode_values(data: &[u8]) -> Result<Vec<String>> {
         if offset + 4 > data.len() {
             return Err(anyhow::anyhow!("Corrupted row encoding"));
         }
-        let len = u32::from_le_bytes(data[offset..offset+4].try_into()?) as usize;
+        let len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
         offset += 4;
         if offset + len > data.len() {
             return Err(anyhow::anyhow!("Corrupted row encoding"));
         }
-        let s = String::from_utf8(data[offset..offset+len].to_vec())?;
+        let s = String::from_utf8(data[offset..offset + len].to_vec())?;
         offset += len;
         values.push(s);
     }
@@ -40,7 +40,7 @@ pub struct Executor<'a> {
 
 impl<'a> Executor<'a> {
     pub fn new(db: &'a mut Database) -> Self {
-        Self { 
+        Self {
             db,
             in_transaction: false,
             write_buffer: BTreeMap::new(),
@@ -79,44 +79,57 @@ impl<'a> Executor<'a> {
                 self.in_transaction = false;
                 Ok("Query OK, transaction rolled back.".to_string())
             }
-            Statement::CreateTable { table_name, columns } => {
+            Statement::CreateTable {
+                table_name,
+                columns,
+            } => {
                 let schema_key = format!("__schema__:{}", table_name);
-                
+
                 if self.db.get(schema_key.as_bytes())?.is_some() {
                     return Err(anyhow::anyhow!("Table '{}' already exists", table_name));
                 }
-                
+
                 let schema_val = columns.join(",");
                 if self.in_transaction {
-                    self.write_buffer.insert(schema_key.into_bytes(), Some(schema_val.into_bytes()));
+                    self.write_buffer
+                        .insert(schema_key.into_bytes(), Some(schema_val.into_bytes()));
                 } else {
                     self.db.put(schema_key.as_bytes(), schema_val.as_bytes())?;
                 }
-                
+
                 Ok(format!("Query OK, table '{}' created.", table_name))
             }
             Statement::Insert { table_name, values } => {
                 let schema_key = format!("__schema__:{}", table_name);
-                let schema_bytes = if self.in_transaction && self.write_buffer.contains_key(schema_key.as_bytes()) {
-                    self.write_buffer.get(schema_key.as_bytes()).unwrap().clone()
+                let schema_bytes = if self.in_transaction
+                    && self.write_buffer.contains_key(schema_key.as_bytes())
+                {
+                    self.write_buffer
+                        .get(schema_key.as_bytes())
+                        .unwrap()
+                        .clone()
                 } else {
                     self.db.get(schema_key.as_bytes())?
                 };
 
                 let schema_bytes = schema_bytes
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
-                
+
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let columns: Vec<&str> = schema_val.split(',').collect();
-                
+
                 if values.len() != columns.len() {
-                    return Err(anyhow::anyhow!("Column count mismatch: expected {}, got {}", columns.len(), values.len()));
+                    return Err(anyhow::anyhow!(
+                        "Column count mismatch: expected {}, got {}",
+                        columns.len(),
+                        values.len()
+                    ));
                 }
-                
+
                 if values.is_empty() {
                     return Err(anyhow::anyhow!("No values provided for insertion"));
                 }
-                
+
                 let pk = &values[0];
                 let internal_key = format!("{}:{}", table_name, pk).into_bytes();
                 let internal_val = encode_values(&values);
@@ -126,13 +139,18 @@ impl<'a> Executor<'a> {
                 } else {
                     self.db.put(&internal_key, &internal_val)?;
                 }
-                
+
                 Ok("Query OK, 1 row inserted.".to_string())
             }
             Statement::Select { table_name } => {
                 let schema_key = format!("__schema__:{}", table_name);
-                let schema_bytes = if self.in_transaction && self.write_buffer.contains_key(schema_key.as_bytes()) {
-                    self.write_buffer.get(schema_key.as_bytes()).unwrap().clone()
+                let schema_bytes = if self.in_transaction
+                    && self.write_buffer.contains_key(schema_key.as_bytes())
+                {
+                    self.write_buffer
+                        .get(schema_key.as_bytes())
+                        .unwrap()
+                        .clone()
                 } else {
                     self.db.get(schema_key.as_bytes())?
                 };
@@ -144,7 +162,7 @@ impl<'a> Executor<'a> {
 
                 let mut records = self.db.scan()?;
                 let prefix = format!("{}:", table_name);
-                
+
                 // Overlay uncommitted writes
                 if self.in_transaction {
                     let prefix_bytes = prefix.as_bytes();
@@ -158,10 +176,11 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
-                
-                let mut output = format!("+-----------------+\n| {} |\n+-----------------+\n", header);
+
+                let mut output =
+                    format!("+-----------------+\n| {} |\n+-----------------+\n", header);
                 let mut count = 0;
-                
+
                 for (key, val) in records {
                     let k_str = String::from_utf8_lossy(&key);
                     if k_str.starts_with(&prefix) {
@@ -171,10 +190,10 @@ impl<'a> Executor<'a> {
                         count += 1;
                     }
                 }
-                
+
                 output.push_str("+-----------------+\n");
                 output.push_str(&format!("{} row(s) in set.", count));
-                
+
                 Ok(output)
             }
         }
@@ -204,17 +223,27 @@ mod tests {
         exec.execute(Statement::CreateTable {
             table_name: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string(), "bio".to_string()],
-        }).unwrap();
+        })
+        .unwrap();
 
         // Insert row with comma
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            values: vec!["1".to_string(), "Alice".to_string(), "Hello, world!".to_string()],
-        }).unwrap();
+            values: vec![
+                "1".to_string(),
+                "Alice".to_string(),
+                "Hello, world!".to_string(),
+            ],
+        })
+        .unwrap();
 
         // Select and assert roundtrip
-        let result = exec.execute(Statement::Select { table_name: "users".to_string() }).unwrap();
-        
+        let result = exec
+            .execute(Statement::Select {
+                table_name: "users".to_string(),
+            })
+            .unwrap();
+
         assert!(result.contains("Hello, world!"));
         assert!(!result.contains("Hello |  world!")); // Should not be replaced
     }

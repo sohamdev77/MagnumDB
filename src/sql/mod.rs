@@ -1,7 +1,7 @@
 //! The SQL Parser and Execution engine.
 
-pub mod parser;
 pub mod executor;
+pub mod parser;
 
-pub use parser::{Parser, Statement};
 pub use executor::Executor;
+pub use parser::{Parser, Statement};

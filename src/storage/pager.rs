@@ -39,7 +39,7 @@ impl Pager {
 
         let metadata = file.metadata()?;
         let file_size = metadata.len();
-        
+
         let num_pages = (file_size / (PAGE_SIZE as u64)) as u32;
 
         Ok(Self { file, num_pages })
@@ -48,8 +48,8 @@ impl Pager {
     /// Reads a page from disk into memory.
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
         let mut page = Page::default();
-        
-        // If the page is out of bounds, we return a blank page for now.
+
+        // If the page is out of bounds, return an empty page to allow the caller to handle allocation.
         // In a strict implementation, reading out of bounds might be an error.
         if page_id >= self.num_pages {
             return Ok(page);
@@ -58,7 +58,7 @@ impl Pager {
         let offset = (page_id as u64) * (PAGE_SIZE as u64);
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut page.data)?;
-        
+
         Ok(page)
     }
 

@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 pub struct BufferPool {
     pager: Pager,
     /// Caches PageId -> (Page, is_dirty)
-    cache: LruCache<PageId, (Page, bool)>, 
+    cache: LruCache<PageId, (Page, bool)>,
 }
 
 impl BufferPool {
@@ -26,7 +26,7 @@ impl BufferPool {
         }
 
         let page = self.pager.read_page(page_id)?;
-        
+
         self.put_and_evict(page_id, page.clone(), false)?;
 
         Ok(page)
@@ -56,7 +56,7 @@ impl BufferPool {
                 }
             }
         }
-        
+
         // If we already have it, we just update it. `put` updates the value and moves to MRU.
         if let Some((_, curr_dirty)) = self.cache.get(&page_id) {
             // Keep it dirty if it was already dirty
@@ -65,7 +65,7 @@ impl BufferPool {
         } else {
             self.cache.put(page_id, (page, is_dirty));
         }
-        
+
         Ok(())
     }
 
@@ -77,14 +77,14 @@ impl BufferPool {
                 to_flush.push((*page_id, page.clone()));
             }
         }
-        
+
         for (page_id, page) in to_flush {
             self.pager.write_page(page_id, &page)?;
             if let Some(entry) = self.cache.get_mut(&page_id) {
                 entry.1 = false;
             }
         }
-        
+
         Ok(())
     }
 
@@ -93,7 +93,7 @@ impl BufferPool {
         self.pager.sync()?;
         Ok(())
     }
-    
+
     /// Returns the total number of allocated pages on disk.
     pub fn get_num_pages(&self) -> u32 {
         self.pager.num_pages
@@ -109,7 +109,7 @@ mod tests {
     fn test_buffer_pool_eviction() -> anyhow::Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path().to_path_buf();
-        
+
         let pager = Pager::open(&path)?;
         // Create pool with capacity of exactly 2 pages
         let mut pool = BufferPool::new(pager, 2);
@@ -136,7 +136,7 @@ mod tests {
         pool.write_page(id2, &page2)?;
 
         // Now cache has id1 and id2. id0 was evicted and written to disk.
-        
+
         // Let's create a new pager directly to read from disk and verify id0 was written
         let mut direct_pager = Pager::open(&path)?;
         let read_page0 = direct_pager.read_page(id0)?;

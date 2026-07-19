@@ -1,6 +1,6 @@
 # MagnumDB Roadmap
 
-This document outlines the planned feature phases for MagnumDB. We aim to build incrementally, ensuring each phase is robust and heavily tested before proceeding.
+This document outlines the planned roadmap for MagnumDB. We aim to build incrementally, ensuring each subsystem is robust and heavily tested before proceeding.
 
 ## Phase 1: Core Storage Engine
 - [x] Key-Value Store

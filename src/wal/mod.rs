@@ -2,9 +2,9 @@
 //!
 //! Provides durability by logging all mutations before they are applied to the main data files.
 
-use std::path::{Path, PathBuf};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 /// Represents an operation logged in the WAL.
 pub enum WalEntry {
@@ -28,17 +28,14 @@ impl WriteAheadLog {
             .append(true)
             .open(&path)?;
 
-        Ok(Self {
-            file,
-            _path: path,
-        })
+        Ok(Self { file, _path: path })
     }
 
     /// Reads all entries from the WAL for crash recovery.
     pub fn recover(&mut self) -> io::Result<Vec<WalEntry>> {
         let mut entries = Vec::new();
         self.file.seek(SeekFrom::Start(0))?;
-        
+
         loop {
             let mut type_buf = [0u8; 1];
             if let Err(e) = self.file.read_exact(&mut type_buf) {
@@ -47,38 +44,52 @@ impl WriteAheadLog {
                 }
                 break; // Partial write / crash mid-write
             }
-            
+
             match type_buf[0] {
-                1 => { // PUT
+                1 => {
+                    // PUT
                     let mut len_buf = [0u8; 4];
-                    if self.file.read_exact(&mut len_buf).is_err() { break; }
+                    if self.file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let key_len = u32::from_le_bytes(len_buf) as usize;
-                    
+
                     let mut key = vec![0; key_len];
-                    if self.file.read_exact(&mut key).is_err() { break; }
-                    
-                    if self.file.read_exact(&mut len_buf).is_err() { break; }
+                    if self.file.read_exact(&mut key).is_err() {
+                        break;
+                    }
+
+                    if self.file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let val_len = u32::from_le_bytes(len_buf) as usize;
-                    
+
                     let mut val = vec![0; val_len];
-                    if self.file.read_exact(&mut val).is_err() { break; }
-                    
+                    if self.file.read_exact(&mut val).is_err() {
+                        break;
+                    }
+
                     entries.push(WalEntry::Put(key, val));
                 }
-                2 => { // DELETE
+                2 => {
+                    // DELETE
                     let mut len_buf = [0u8; 4];
-                    if self.file.read_exact(&mut len_buf).is_err() { break; }
+                    if self.file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let key_len = u32::from_le_bytes(len_buf) as usize;
-                    
+
                     let mut key = vec![0; key_len];
-                    if self.file.read_exact(&mut key).is_err() { break; }
-                    
+                    if self.file.read_exact(&mut key).is_err() {
+                        break;
+                    }
+
                     entries.push(WalEntry::Delete(key));
                 }
                 _ => break, // Corrupted type, stop replay
             }
         }
-        
+
         // Seek to end so subsequent appends work correctly
         self.file.seek(SeekFrom::End(0))?;
         Ok(entries)

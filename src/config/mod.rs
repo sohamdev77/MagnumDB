@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// The main configuration structure for MagnumDB.
 #[derive(Debug, Clone, Serialize, Deserialize)]

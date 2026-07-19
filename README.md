@@ -17,7 +17,7 @@ MagnumDB is a production-quality, open-source embedded database engine written i
 - **ACID Transactions**: Single-writer transactions with WAL-backed durability.
 - **Crash Recovery**: Write-Ahead Log (WAL) ensures durability and consistency.
 - **B+ Tree Indexing**: Efficient storage and retrieval mechanism.
-- **SQL Support**: Built-in SQL parser (Phase 3).
+- **SQL Support**: Built-in SQL parser and executor.
 - **Extensible**: Highly modular architecture.
 
 ## Architecture
@@ -138,7 +138,7 @@ magnum> SELECT * FROM users;
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for our detailed release plan (Phases 1-7).
+See [ROADMAP.md](ROADMAP.md) for our detailed release plan.
 
 ## Contributing
 
