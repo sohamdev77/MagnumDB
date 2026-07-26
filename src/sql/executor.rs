@@ -36,6 +36,9 @@ fn decode_values(data: &[u8]) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// Separator used to store multiple PKs in a secondary index entry.
+const SEC_IDX_PK_SEP: &str = "\x1F"; // ASCII Unit Separator
+
 pub struct Executor<'a> {
     db: &'a mut Database,
     in_transaction: bool,
@@ -69,13 +72,14 @@ impl<'a> Executor<'a> {
                 if !self.in_transaction {
                     return Err(anyhow::anyhow!("No transaction in progress"));
                 }
+                let tx_id = self.current_tx_id;
                 for (key, value_opt) in &self.write_buffer {
                     match value_opt {
-                        Some(val) => self.db.put(key, val)?,
-                        None => self.db.delete(key)?,
+                        Some(val) => self.db.put_with_tx(tx_id, key, val)?,
+                        None => self.db.delete_with_tx(tx_id, key)?,
                     }
                 }
-                self.db.commit_tx(self.current_tx_id)?;
+                self.db.commit_tx(tx_id)?;
                 self.write_buffer.clear();
                 self.in_transaction = false;
                 self.current_tx_id = 0;
@@ -129,11 +133,7 @@ impl<'a> Executor<'a> {
 
                 // Populate secondary index from existing records
                 let schema_val = String::from_utf8(schema_bytes)?;
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
+                let col_names = Self::extract_col_names(&schema_val);
 
                 let col_idx = col_names.iter().position(|c| c == &column).ok_or_else(|| {
                     anyhow::anyhow!("Column '{}' not found in table '{}'", column, table_name)
@@ -147,9 +147,7 @@ impl<'a> Executor<'a> {
                     if col_idx < decoded.len() {
                         let col_val = &decoded[col_idx];
                         let pk = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
-                        let sec_key =
-                            format!("__secidx__:{}:{}:{}", table_name, column, col_val);
-                        self.db.put(sec_key.as_bytes(), pk.as_bytes())?;
+                        self.sec_idx_add(&table_name, &column, col_val, &pk)?;
                     }
                 }
 
@@ -164,11 +162,8 @@ impl<'a> Executor<'a> {
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
 
                 let schema_val = String::from_utf8(schema_bytes)?;
+                let col_names = Self::extract_col_names(&schema_val);
                 let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
 
                 if values.len() != col_defs.len() {
                     return Err(anyhow::anyhow!(
@@ -193,25 +188,7 @@ impl<'a> Executor<'a> {
                 }
 
                 // Sync secondary index entries if any exist
-                let idx_prefix = format!("__index__:{}:", table_name);
-                let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
-                for (idx_key, col_val_bytes) in indices {
-                    let col_name = String::from_utf8_lossy(&col_val_bytes).to_string();
-                    if let Some(col_idx) = col_names.iter().position(|c| c == &col_name) {
-                        if col_idx < values.len() {
-                            let sec_val = &values[col_idx];
-                            let sec_key =
-                                format!("__secidx__:{}:{}:{}", table_name, col_name, sec_val);
-                            if self.in_transaction {
-                                self.write_buffer
-                                    .insert(sec_key.into_bytes(), Some(pk.as_bytes().to_vec()));
-                            } else {
-                                self.db.put(sec_key.as_bytes(), pk.as_bytes())?;
-                            }
-                        }
-                    }
-                    let _ = idx_key;
-                }
+                self.sync_secondary_indexes_on_insert(&table_name, &col_names, &values, pk)?;
 
                 Ok("Query OK, 1 row inserted.".to_string())
             }
@@ -223,11 +200,7 @@ impl<'a> Executor<'a> {
                     .get_schema_bytes(&table_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
+                let col_names = Self::extract_col_names(&schema_val);
 
                 let header = col_names.join(" | ");
 
@@ -292,11 +265,7 @@ impl<'a> Executor<'a> {
                     .get_schema_bytes(&table_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
+                let col_names = Self::extract_col_names(&schema_val);
 
                 let col_idx = col_names
                     .iter()
@@ -359,11 +328,7 @@ impl<'a> Executor<'a> {
                     .get_schema_bytes(&table_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
+                let col_names = Self::extract_col_names(&schema_val);
 
                 let prefix = format!("{}:", table_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
@@ -424,11 +389,7 @@ impl<'a> Executor<'a> {
                     .get_schema_bytes(&table_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
-                let col_names: Vec<&str> = col_defs
-                    .iter()
-                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
-                    .collect();
+                let col_names = Self::extract_col_names(&schema_val);
 
                 let col_idx = col_names
                     .iter()
@@ -457,7 +418,15 @@ impl<'a> Executor<'a> {
                 if col_idx >= row_values.len() {
                     return Err(anyhow::anyhow!("Corrupted row length"));
                 }
-                row_values[col_idx] = value;
+
+                // Remove old secondary index entries for the changed column
+                let old_value = row_values[col_idx].clone();
+                self.sec_idx_remove_for_column(&table_name, &column, &old_value, &pk_val)?;
+
+                row_values[col_idx] = value.clone();
+
+                // Add new secondary index entries for the updated column
+                self.sec_idx_add_for_column(&table_name, &column, &value, &pk_val)?;
 
                 let updated_bytes = encode_values(&row_values);
 
@@ -471,6 +440,29 @@ impl<'a> Executor<'a> {
             }
             Statement::Delete { table_name, pk_val } => {
                 let internal_key = format!("{}:{}", table_name, pk_val).into_bytes();
+
+                // Read the row before deleting to clean up secondary indexes
+                let existing_bytes = if self.in_transaction
+                    && self.write_buffer.contains_key(&internal_key)
+                {
+                    self.write_buffer.get(&internal_key).cloned().flatten()
+                } else {
+                    self.db.get(&internal_key)?
+                };
+
+                if let Some(row_data) = existing_bytes {
+                    // Clean up secondary indexes
+                    if let Ok(Some(sb)) = self.get_schema_bytes(&table_name) {
+                        if let Ok(schema_val) = String::from_utf8(sb) {
+                            let col_names = Self::extract_col_names(&schema_val);
+                            if let Ok(decoded) = decode_values(&row_data) {
+                                self.remove_all_secondary_indexes(
+                                    &table_name, &col_names, &decoded, &pk_val,
+                                )?;
+                            }
+                        }
+                    }
+                }
 
                 if self.in_transaction {
                     self.write_buffer.insert(internal_key, None);
@@ -489,6 +481,19 @@ impl<'a> Executor<'a> {
 
                 let prefix = format!("{}:", table_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
+
+                // Clean up secondary indexes and index metadata
+                let idx_prefix = format!("__index__:{}:", table_name);
+                let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
+                for (idx_key, _) in &indices {
+                    self.db.delete(idx_key)?;
+                }
+                // Clean up all secidx entries for this table
+                let sec_prefix = format!("__secidx__:{}:", table_name);
+                let sec_entries = self.db.scan_prefix(sec_prefix.as_bytes())?;
+                for (sec_key, _) in sec_entries {
+                    self.db.delete(&sec_key)?;
+                }
 
                 if self.in_transaction {
                     self.write_buffer.insert(schema_key.into_bytes(), None);
@@ -529,6 +534,8 @@ impl<'a> Executor<'a> {
         }
     }
 
+    // ---- Helper methods ----
+
     fn get_schema_bytes(&mut self, table_name: &str) -> Result<Option<Vec<u8>>> {
         let schema_key = format!("__schema__:{}", table_name);
         if self.in_transaction && self.write_buffer.contains_key(schema_key.as_bytes()) {
@@ -536,6 +543,161 @@ impl<'a> Executor<'a> {
         } else {
             self.db.get(schema_key.as_bytes())
         }
+    }
+
+    /// Extracts column names from a schema string like "id INT,name TEXT,age INT".
+    fn extract_col_names(schema_val: &str) -> Vec<String> {
+        schema_val
+            .split(',')
+            .map(|c| {
+                c.split_whitespace()
+                    .next()
+                    .unwrap_or(c.trim())
+                    .to_string()
+            })
+            .collect()
+    }
+
+    // ---- Secondary Index Helpers ----
+
+    /// Adds a PK to a secondary index entry (multi-value safe).
+    fn sec_idx_add(&mut self, table: &str, column: &str, col_val: &str, pk: &str) -> Result<()> {
+        let sec_key = format!("__secidx__:{}:{}:{}", table, column, col_val);
+        let existing = self.db.get(sec_key.as_bytes())?;
+
+        let new_val = match existing {
+            Some(data) => {
+                let existing_str = String::from_utf8_lossy(&data).to_string();
+                // Check if PK already exists
+                let pks: Vec<&str> = existing_str.split(SEC_IDX_PK_SEP).collect();
+                if pks.contains(&pk) {
+                    return Ok(()); // Already indexed
+                }
+                format!("{}{}{}", existing_str, SEC_IDX_PK_SEP, pk)
+            }
+            None => pk.to_string(),
+        };
+
+        if self.in_transaction {
+            self.write_buffer
+                .insert(sec_key.into_bytes(), Some(new_val.into_bytes()));
+        } else {
+            self.db.put(sec_key.as_bytes(), new_val.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Removes a PK from a secondary index entry (multi-value safe).
+    fn sec_idx_remove(&mut self, table: &str, column: &str, col_val: &str, pk: &str) -> Result<()> {
+        let sec_key = format!("__secidx__:{}:{}:{}", table, column, col_val);
+        let existing = self.db.get(sec_key.as_bytes())?;
+
+        if let Some(data) = existing {
+            let existing_str = String::from_utf8_lossy(&data).to_string();
+            let pks: Vec<&str> = existing_str
+                .split(SEC_IDX_PK_SEP)
+                .filter(|p| *p != pk)
+                .collect();
+
+            if pks.is_empty() {
+                if self.in_transaction {
+                    self.write_buffer.insert(sec_key.into_bytes(), None);
+                } else {
+                    self.db.delete(sec_key.as_bytes())?;
+                }
+            } else {
+                let new_val = pks.join(SEC_IDX_PK_SEP);
+                if self.in_transaction {
+                    self.write_buffer
+                        .insert(sec_key.into_bytes(), Some(new_val.into_bytes()));
+                } else {
+                    self.db.put(sec_key.as_bytes(), new_val.as_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Syncs secondary indexes when inserting a new row.
+    fn sync_secondary_indexes_on_insert(
+        &mut self,
+        table_name: &str,
+        col_names: &[String],
+        values: &[String],
+        pk: &str,
+    ) -> Result<()> {
+        let idx_prefix = format!("__index__:{}:", table_name);
+        let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
+        for (_idx_key, col_val_bytes) in indices {
+            let col_name = String::from_utf8_lossy(&col_val_bytes).to_string();
+            if let Some(col_idx) = col_names.iter().position(|c| c == &col_name) {
+                if col_idx < values.len() {
+                    let sec_val = &values[col_idx];
+                    self.sec_idx_add(table_name, &col_name, sec_val, pk)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes secondary index entries for a specific column value.
+    fn sec_idx_remove_for_column(
+        &mut self,
+        table_name: &str,
+        column: &str,
+        col_val: &str,
+        pk: &str,
+    ) -> Result<()> {
+        let idx_prefix = format!("__index__:{}:", table_name);
+        let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
+        for (_idx_key, col_val_bytes) in indices {
+            let indexed_col = String::from_utf8_lossy(&col_val_bytes).to_string();
+            if indexed_col == column {
+                self.sec_idx_remove(table_name, column, col_val, pk)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds secondary index entries for a specific column value.
+    fn sec_idx_add_for_column(
+        &mut self,
+        table_name: &str,
+        column: &str,
+        col_val: &str,
+        pk: &str,
+    ) -> Result<()> {
+        let idx_prefix = format!("__index__:{}:", table_name);
+        let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
+        for (_idx_key, col_val_bytes) in indices {
+            let indexed_col = String::from_utf8_lossy(&col_val_bytes).to_string();
+            if indexed_col == column {
+                self.sec_idx_add(table_name, column, col_val, pk)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes all secondary index entries for a row being deleted.
+    fn remove_all_secondary_indexes(
+        &mut self,
+        table_name: &str,
+        col_names: &[String],
+        row_values: &[String],
+        pk: &str,
+    ) -> Result<()> {
+        let idx_prefix = format!("__index__:{}:", table_name);
+        let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
+        for (_idx_key, col_val_bytes) in indices {
+            let col_name = String::from_utf8_lossy(&col_val_bytes).to_string();
+            if let Some(col_idx) = col_names.iter().position(|c| c == &col_name) {
+                if col_idx < row_values.len() {
+                    let col_val = &row_values[col_idx];
+                    self.sec_idx_remove(table_name, &col_name, col_val, pk)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -550,6 +712,7 @@ mod tests {
         let mut config = Config::default();
         config.storage.path = dir.path().to_path_buf();
         config.wal.enabled = false;
+        config.storage.sync_interval = 0;
         Database::open(config).unwrap()
     }
 
@@ -624,6 +787,128 @@ mod tests {
         let sec_key = b"__secidx__:users:name:Charlie";
         let pk = db.get(sec_key).unwrap().unwrap();
         assert_eq!(pk, b"1");
+    }
+
+    #[test]
+    fn test_executor_secondary_index_multi_pk() {
+        let mut db = setup_db();
+        let mut exec = Executor::new(&mut db);
+
+        exec.execute(Statement::CreateTable {
+            table_name: "users".to_string(),
+            columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+        })
+        .unwrap();
+
+        exec.execute(Statement::CreateIndex {
+            index_name: "idx_name".to_string(),
+            table_name: "users".to_string(),
+            column: "name".to_string(),
+        })
+        .unwrap();
+
+        // Insert two users with the same name
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["1".to_string(), "Alice".to_string()],
+        })
+        .unwrap();
+
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["2".to_string(), "Alice".to_string()],
+        })
+        .unwrap();
+
+        let sec_key = b"__secidx__:users:name:Alice";
+        let pks = db.get(sec_key).unwrap().unwrap();
+        let pks_str = String::from_utf8(pks).unwrap();
+        assert!(pks_str.contains("1"));
+        assert!(pks_str.contains("2"));
+    }
+
+    #[test]
+    fn test_executor_delete_cleans_secondary_index() {
+        let mut db = setup_db();
+
+        {
+            let mut exec = Executor::new(&mut db);
+            exec.execute(Statement::CreateTable {
+                table_name: "users".to_string(),
+                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+            })
+            .unwrap();
+
+            exec.execute(Statement::CreateIndex {
+                index_name: "idx_name".to_string(),
+                table_name: "users".to_string(),
+                column: "name".to_string(),
+            })
+            .unwrap();
+
+            exec.execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["1".to_string(), "Alice".to_string()],
+            })
+            .unwrap();
+        }
+
+        // Verify index exists
+        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_some());
+
+        // Delete the row
+        {
+            let mut exec = Executor::new(&mut db);
+            exec.execute(Statement::Delete {
+                table_name: "users".to_string(),
+                pk_val: "1".to_string(),
+            })
+            .unwrap();
+        }
+
+        // Verify index is cleaned up
+        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_executor_update_updates_secondary_index() {
+        let mut db = setup_db();
+        {
+            let mut exec = Executor::new(&mut db);
+
+            exec.execute(Statement::CreateTable {
+                table_name: "users".to_string(),
+                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+            })
+            .unwrap();
+
+            exec.execute(Statement::CreateIndex {
+                index_name: "idx_name".to_string(),
+                table_name: "users".to_string(),
+                column: "name".to_string(),
+            })
+            .unwrap();
+
+            exec.execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["1".to_string(), "Alice".to_string()],
+            })
+            .unwrap();
+
+            // Update name
+            exec.execute(Statement::Update {
+                table_name: "users".to_string(),
+                column: "name".to_string(),
+                value: "Bob".to_string(),
+                pk_val: "1".to_string(),
+            })
+            .unwrap();
+        }
+
+        // Old index entry should be gone
+        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
+        // New index entry should exist
+        assert!(db.get(b"__secidx__:users:name:Bob").unwrap().is_some());
     }
 
     #[test]

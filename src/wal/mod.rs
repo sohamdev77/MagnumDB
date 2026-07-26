@@ -31,7 +31,7 @@ pub enum WalOpType {
 pub struct WriteAheadLog {
     file: File,
     _path: PathBuf,
-    current_lsn: u64,
+    lsn: u64,
 }
 
 impl WriteAheadLog {
@@ -47,12 +47,18 @@ impl WriteAheadLog {
         Ok(Self {
             file,
             _path: path,
-            current_lsn: 0,
+            lsn: 0,
         })
     }
 
+    /// Returns the current LSN.
+    pub fn current_lsn(&self) -> u64 {
+        self.lsn
+    }
+
     /// Reads all committed entries from the WAL for crash recovery, verifying CRC32 checksums.
-    pub fn recover(&mut self) -> io::Result<Vec<WalEntry>> {
+    /// Only replays entries with LSN > checkpoint_lsn, skipping already-checkpointed data.
+    pub fn recover(&mut self, checkpoint_lsn: u64) -> io::Result<Vec<WalEntry>> {
         let mut committed_entries = Vec::new();
         let mut active_txs: HashMap<u64, Vec<WalEntry>> = HashMap::new();
         self.file.seek(SeekFrom::Start(0))?;
@@ -113,6 +119,22 @@ impl WriteAheadLog {
 
             if lsn > max_lsn {
                 max_lsn = lsn;
+            }
+
+            // Skip entries that were already checkpointed
+            if lsn <= checkpoint_lsn {
+                // Still need to process BEGIN/COMMIT/ROLLBACK markers to track tx state
+                match op_code {
+                    3 => {
+                        if tx_id > 0 {
+                            active_txs.insert(tx_id, Vec::new());
+                        }
+                    }
+                    4 => { active_txs.remove(&tx_id); }
+                    5 => { active_txs.remove(&tx_id); }
+                    _ => {}
+                }
+                continue;
             }
 
             match op_code {
@@ -190,14 +212,14 @@ impl WriteAheadLog {
             }
         }
 
-        self.current_lsn = max_lsn;
+        self.lsn = max_lsn;
         self.file.seek(SeekFrom::End(0))?;
         Ok(committed_entries)
     }
 
     fn write_record(&mut self, tx_id: u64, op_type: WalOpType, payload: &[u8]) -> io::Result<u64> {
-        self.current_lsn += 1;
-        let lsn = self.current_lsn;
+        self.lsn += 1;
+        let lsn = self.lsn;
 
         let mut header = [0u8; 21];
         header[0..8].copy_from_slice(&lsn.to_le_bytes());
@@ -217,7 +239,7 @@ impl WriteAheadLog {
         Ok(lsn)
     }
 
-    /// Appends a PUT operation to the WAL.
+    /// Appends a PUT operation to the WAL (non-transactional).
     pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> io::Result<u64> {
         self.append_tx_put(0, key, value)
     }
@@ -233,7 +255,7 @@ impl WriteAheadLog {
         self.write_record(tx_id, WalOpType::Put, &payload)
     }
 
-    /// Appends a DELETE operation to the WAL.
+    /// Appends a DELETE operation to the WAL (non-transactional).
     pub fn append_delete(&mut self, key: &[u8]) -> io::Result<u64> {
         self.append_tx_delete(0, key)
     }
@@ -272,7 +294,7 @@ impl WriteAheadLog {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_data()?;
-        self.current_lsn = 0;
+        self.lsn = 0;
         Ok(())
     }
 }

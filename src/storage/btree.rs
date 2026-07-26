@@ -4,13 +4,22 @@
 //! Supports B+ Tree splits, node recycling, prefix range scanning, and overflow page chaining for large values.
 
 use super::buffer_pool::BufferPool;
-use super::pager::{Page, PageId, PAGE_SIZE};
+use super::pager::{Page, PageId, PAGE_SIZE, META_ROOT_PAGE_RANGE};
 
 const NODE_TYPE_LEAF: u8 = 0;
 const NODE_TYPE_INTERNAL: u8 = 1;
 
-/// Maximum inline size of a key-value record before splitting or spilling to overflow pages.
-pub const MAX_INLINE_VAL_SIZE: usize = 3000;
+/// Header sizes for bounds checking
+const LEAF_HEADER_SIZE: usize = 1 + 2 + 4 + 4; // type + num_records + parent_id + next_leaf = 11
+const INTERNAL_HEADER_SIZE: usize = 1 + 2 + 4;  // type + num_keys + parent_id = 7
+
+/// Maximum inline size of a key-value record before spilling to overflow pages.
+/// Set conservatively to leave room for header + key length field + value length field.
+pub const MAX_INLINE_VAL_SIZE: usize = 2000;
+
+/// Maximum key size. Keys larger than this are rejected.
+pub const MAX_KEY_SIZE: usize = 1024;
+
 const OVERFLOW_MAGIC: &[u8; 4] = b"OVRF";
 
 /// In-memory representation of a B+ Tree node.
@@ -36,7 +45,16 @@ pub struct InternalNode {
 
 impl Node {
     /// Serializes the node into a fixed 4KB page.
-    pub fn to_page(&self) -> Page {
+    /// Returns an error if the node data exceeds the page size.
+    pub fn to_page(&self) -> anyhow::Result<Page> {
+        let size = self.encoded_size();
+        if size > PAGE_SIZE {
+            return Err(anyhow::anyhow!(
+                "Node encoded size {} exceeds page size {}. This is a bug — the node should have been split before serialization.",
+                size, PAGE_SIZE
+            ));
+        }
+
         let mut page = Page::default();
         let mut offset = 0;
 
@@ -100,7 +118,7 @@ impl Node {
             }
         }
 
-        page
+        Ok(page)
     }
 
     /// Deserializes a node from a fixed 4KB page.
@@ -122,15 +140,19 @@ impl Node {
 
             let mut records = Vec::new();
             for _ in 0..num_elements {
+                if offset + 4 > PAGE_SIZE { break; }
                 let klen =
                     u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
+                if offset + klen > PAGE_SIZE { break; }
                 let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
 
+                if offset + 4 > PAGE_SIZE { break; }
                 let vlen =
                     u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
+                if offset + vlen > PAGE_SIZE { break; }
                 let val = page.data[offset..offset + vlen].to_vec();
                 offset += vlen;
 
@@ -145,6 +167,7 @@ impl Node {
         } else {
             let mut children = Vec::new();
             for _ in 0..=num_elements {
+                if offset + 4 > PAGE_SIZE { break; }
                 let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4]));
                 offset += 4;
                 children.push(child);
@@ -152,9 +175,11 @@ impl Node {
 
             let mut keys = Vec::new();
             for _ in 0..num_elements {
+                if offset + 4 > PAGE_SIZE { break; }
                 let klen =
                     u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
+                if offset + klen > PAGE_SIZE { break; }
                 let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
                 keys.push(key);
@@ -172,14 +197,14 @@ impl Node {
     pub fn encoded_size(&self) -> usize {
         match self {
             Node::Leaf(leaf) => {
-                let mut size = 1 + 2 + 4 + 4; // header
+                let mut size = LEAF_HEADER_SIZE;
                 for (k, v) in &leaf.records {
                     size += 4 + k.len() + 4 + v.len();
                 }
                 size
             }
             Node::Internal(internal) => {
-                let mut size = 1 + 2 + 4; // header
+                let mut size = INTERNAL_HEADER_SIZE;
                 size += internal.children.len() * 4;
                 for k in &internal.keys {
                     size += 4 + k.len();
@@ -199,7 +224,9 @@ pub struct BTree {
 impl BTree {
     pub fn new(mut buffer_pool: BufferPool) -> anyhow::Result<Self> {
         let meta_page = buffer_pool.fetch_page(0)?;
-        let stored_root = u32::from_le_bytes(meta_page.data[0..4].try_into().unwrap_or([0; 4]));
+        let stored_root = u32::from_le_bytes(
+            meta_page.data[META_ROOT_PAGE_RANGE].try_into().unwrap_or([0; 4]),
+        );
 
         let root_page_id = if stored_root == 0 || stored_root == u32::MAX {
             // Page 1: Root leaf
@@ -210,11 +237,11 @@ impl BTree {
                 next_leaf: None,
                 records: Vec::new(),
             });
-            buffer_pool.write_page(new_page_id, &empty_leaf.to_page())?;
+            buffer_pool.write_page(new_page_id, &empty_leaf.to_page()?)?;
 
             // Write metadata to Page 0
             let mut meta_page = buffer_pool.fetch_page(0)?;
-            meta_page.data[0..4].copy_from_slice(&new_page_id.to_le_bytes());
+            meta_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&new_page_id.to_le_bytes());
             buffer_pool.write_page(0, &meta_page)?;
 
             new_page_id
@@ -230,7 +257,7 @@ impl BTree {
 
     fn persist_root_page_id(&mut self, root_page_id: PageId) -> anyhow::Result<()> {
         let mut meta_page = self.buffer_pool.fetch_page(0)?;
-        meta_page.data[0..4].copy_from_slice(&root_page_id.to_le_bytes());
+        meta_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&root_page_id.to_le_bytes());
         self.buffer_pool.write_page(0, &meta_page)?;
         Ok(())
     }
@@ -239,8 +266,17 @@ impl BTree {
         self.buffer_pool.flush_all()
     }
 
+    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+        self.buffer_pool.flush_and_sync()
+    }
+
     pub fn sync(&mut self) -> anyhow::Result<()> {
         self.buffer_pool.sync()
+    }
+
+    /// Returns a mutable reference to the underlying buffer pool.
+    pub fn buffer_pool_mut(&mut self) -> &mut BufferPool {
+        &mut self.buffer_pool
     }
 
     fn read_node(&mut self, page_id: PageId) -> anyhow::Result<Node> {
@@ -249,7 +285,7 @@ impl BTree {
     }
 
     fn write_node(&mut self, page_id: PageId, node: &Node) -> anyhow::Result<()> {
-        let page = node.to_page();
+        let page = node.to_page()?;
         self.buffer_pool.write_page(page_id, &page)?;
         Ok(())
     }
@@ -328,6 +364,14 @@ impl BTree {
 
     /// Inserts a key-value pair into the BTree.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        if key.len() > MAX_KEY_SIZE {
+            return Err(anyhow::anyhow!(
+                "Key size {} exceeds maximum allowed {}",
+                key.len(),
+                MAX_KEY_SIZE
+            ));
+        }
+
         let stored_val = if value.len() > MAX_INLINE_VAL_SIZE {
             self.write_overflow_value(value)?
         } else {
@@ -572,7 +616,8 @@ impl BTree {
         Ok(results)
     }
 
-    /// Deletes a key from the BTree and reclaims pages.
+    /// Deletes a key from the BTree.
+    /// If the leaf becomes empty after deletion, the page is freed and sibling pointers are updated.
     pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
         let root_node = self.read_node(self.root_page_id)?;
         let (leaf_id, mut leaf_node) =
@@ -584,10 +629,72 @@ impl BTree {
         {
             let removed = leaf_node.records.remove(pos);
             self.free_overflow_chain(&removed.1)?;
-            self.write_node(leaf_id, &Node::Leaf(leaf_node))?;
+
+            // If the leaf is empty and it's not the root, free the page
+            if leaf_node.records.is_empty() && leaf_id != self.root_page_id {
+                // Update the previous leaf's next_leaf pointer to skip this leaf.
+                // We do a scan from the leftmost leaf to find the previous sibling.
+                self.unlink_empty_leaf(leaf_id, &leaf_node)?;
+            } else {
+                self.write_node(leaf_id, &Node::Leaf(leaf_node))?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Unlinks an empty leaf from the sibling chain and frees its page.
+    fn unlink_empty_leaf(&mut self, leaf_id: PageId, leaf_node: &LeafNode) -> anyhow::Result<()> {
+        // Find the leftmost leaf by traversing from root
+        let leftmost_leaf_id = self.find_leftmost_leaf(self.root_page_id)?;
+
+        if leftmost_leaf_id == leaf_id {
+            // This is the leftmost leaf, just write it empty (don't free root-adjacent leaves
+            // to avoid complex parent pointer updates)
+            self.write_node(leaf_id, &Node::Leaf(leaf_node.clone()))?;
+            return Ok(());
+        }
+
+        // Walk the sibling chain to find the previous leaf
+        let mut prev_id = leftmost_leaf_id;
+        loop {
+            let prev_node = self.read_node(prev_id)?;
+            if let Node::Leaf(mut prev_leaf) = prev_node {
+                if prev_leaf.next_leaf == Some(leaf_id) {
+                    // Found the previous sibling — update its pointer
+                    prev_leaf.next_leaf = leaf_node.next_leaf;
+                    self.write_node(prev_id, &Node::Leaf(prev_leaf))?;
+                    self.buffer_pool.free_page(leaf_id)?;
+                    return Ok(());
+                }
+                if let Some(next) = prev_leaf.next_leaf {
+                    prev_id = next;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Fallback: couldn't find prev sibling, just write the empty leaf
+        self.write_node(leaf_id, &Node::Leaf(leaf_node.clone()))?;
+        Ok(())
+    }
+
+    /// Finds the leftmost leaf page by always taking the first child from root.
+    fn find_leftmost_leaf(&mut self, page_id: PageId) -> anyhow::Result<PageId> {
+        let node = self.read_node(page_id)?;
+        match node {
+            Node::Leaf(_) => Ok(page_id),
+            Node::Internal(internal) => {
+                if internal.children.is_empty() {
+                    Ok(page_id)
+                } else {
+                    self.find_leftmost_leaf(internal.children[0])
+                }
+            }
+        }
     }
 }
 
@@ -635,6 +742,14 @@ mod tests {
 
         btree.delete(key).unwrap();
         assert!(btree.search(key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_btree_rejects_oversized_key() {
+        let mut btree = setup_btree();
+        let big_key = vec![b'x'; MAX_KEY_SIZE + 1];
+        let result = btree.insert(&big_key, b"val");
+        assert!(result.is_err());
     }
 
     #[test]

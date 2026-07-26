@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
 
+/// Reserved internal key prefix. Table and column names must not start with this.
+const RESERVED_PREFIX: &str = "__";
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
     CreateTable {
@@ -84,6 +87,20 @@ impl Parser {
         }
     }
 
+    /// Validates that an identifier (table/column name) doesn't use reserved prefixes.
+    fn validate_identifier(name: &str) -> Result<()> {
+        if name.starts_with(RESERVED_PREFIX) {
+            return Err(anyhow!(
+                "Identifier '{}' uses reserved prefix '{}'. Choose a different name.",
+                name, RESERVED_PREFIX
+            ));
+        }
+        if name.is_empty() {
+            return Err(anyhow!("Identifier cannot be empty"));
+        }
+        Ok(())
+    }
+
     fn parse_create_table(sql: &str) -> Result<Statement> {
         let parts: Vec<&str> = sql.splitn(3, ' ').collect();
         if parts.len() < 3 {
@@ -102,7 +119,13 @@ impl Parser {
             return Err(anyhow!("Syntax Error: Missing column definitions"));
         }
 
-        let columns = cols_str.split(',').map(|s| s.trim().to_string()).collect();
+        Self::validate_identifier(&table_name)?;
+
+        let columns: Vec<String> = cols_str.split(',').map(|s| s.trim().to_string()).collect();
+        for col_def in &columns {
+            let col_name = col_def.split_whitespace().next().unwrap_or("");
+            Self::validate_identifier(col_name)?;
+        }
 
         Ok(Statement::CreateTable {
             table_name,
@@ -129,6 +152,9 @@ impl Parser {
         let table_name = rest[..paren_idx].trim().to_string();
         let column = rest[paren_idx + 1..end_paren].trim().to_string();
 
+        Self::validate_identifier(&table_name)?;
+        Self::validate_identifier(&column)?;
+
         Ok(Statement::CreateIndex {
             index_name,
             table_name,
@@ -152,10 +178,7 @@ impl Parser {
         }
 
         let inner_vals = &values_part[1..values_part.len() - 1];
-        let values = inner_vals
-            .split(',')
-            .map(|s| s.trim().trim_matches('\'').to_string())
-            .collect();
+        let values = split_values_respecting_quotes(inner_vals)?;
 
         Ok(Statement::Insert {
             table_name: table_name_part.to_string(),
@@ -187,13 +210,8 @@ impl Parser {
             let (table_name, where_clause) = if let Some(where_idx) = upper_rest.find("WHERE") {
                 let tname = rest[..where_idx].trim().to_string();
                 let cond = rest[where_idx + 5..].trim();
-                let cond_parts: Vec<&str> = cond.split('=').collect();
-                if cond_parts.len() != 2 {
-                    return Err(anyhow!("Syntax Error: Invalid WHERE clause"));
-                }
-                let col = cond_parts[0].trim().to_string();
-                let val = cond_parts[1].trim().trim_matches('\'').to_string();
-                (tname, Some((col, val)))
+                let wc = parse_where_equality(cond)?;
+                (tname, Some(wc))
             } else {
                 (rest.to_string(), None)
             };
@@ -223,16 +241,10 @@ impl Parser {
                 }
             }
 
-            let cond_parts: Vec<&str> = cond.split('=').collect();
-            if cond_parts.len() != 2 {
-                return Err(anyhow!("Syntax Error: Invalid WHERE clause"));
-            }
-            let col = cond_parts[0].trim().to_string();
-            let val = cond_parts[1].trim().trim_matches('\'').to_string();
-
+            let wc = parse_where_equality(cond)?;
             Ok(Statement::Select {
                 table_name,
-                where_clause: Some((col, val)),
+                where_clause: Some(wc),
             })
         } else {
             Ok(Statement::Select {
@@ -255,19 +267,8 @@ impl Parser {
         let set_expr = sql[set_idx + 3..where_idx].trim();
         let where_expr = sql[where_idx + 5..].trim();
 
-        let set_parts: Vec<&str> = set_expr.split('=').collect();
-        if set_parts.len() != 2 {
-            return Err(anyhow!("Syntax Error: Invalid SET clause in UPDATE"));
-        }
-
-        let column = set_parts[0].trim().to_string();
-        let value = set_parts[1].trim().trim_matches('\'').to_string();
-
-        let where_parts: Vec<&str> = where_expr.split('=').collect();
-        if where_parts.len() != 2 {
-            return Err(anyhow!("Syntax Error: Invalid WHERE clause in UPDATE"));
-        }
-        let pk_val = where_parts[1].trim().trim_matches('\'').to_string();
+        let (column, value) = parse_assignment(set_expr)?;
+        let (_, pk_val) = parse_assignment(where_expr)?;
 
         Ok(Statement::Update {
             table_name,
@@ -285,19 +286,72 @@ impl Parser {
 
         let table_name = sql[11..where_idx].trim().to_string();
         let where_expr = sql[where_idx + 5..].trim();
-        let where_parts: Vec<&str> = where_expr.split('=').collect();
-        if where_parts.len() != 2 {
-            return Err(anyhow!("Syntax Error: Invalid WHERE clause in DELETE"));
-        }
-        let pk_val = where_parts[1].trim().trim_matches('\'').to_string();
+        let (_, pk_val) = parse_assignment(where_expr)?;
 
         Ok(Statement::Delete { table_name, pk_val })
     }
 
     fn parse_drop_table(sql: &str) -> Result<Statement> {
         let table_name = sql[10..].trim().to_string();
+        Self::validate_identifier(&table_name)?;
         Ok(Statement::DropTable { table_name })
     }
+}
+
+/// Splits a comma-separated value list while respecting single-quoted strings.
+/// Handles escaped quotes ('') inside quoted strings.
+fn split_values_respecting_quotes(input: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '\'' {
+                // Check for escaped quote ''
+                if chars.peek() == Some(&'\'') {
+                    current.push('\'');
+                    chars.next(); // consume the second quote
+                } else {
+                    in_quotes = false;
+                    // Don't add the closing quote to the value
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '\'' {
+            in_quotes = true;
+            // Don't add the opening quote to the value
+        } else if ch == ',' {
+            values.push(current.trim().to_string());
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if in_quotes {
+        return Err(anyhow!("Syntax Error: Unterminated string literal"));
+    }
+
+    values.push(current.trim().to_string());
+    Ok(values)
+}
+
+/// Parses a `col = value` or `col = 'value'` assignment, handling quoted values.
+fn parse_assignment(expr: &str) -> Result<(String, String)> {
+    let eq_idx = expr.find('=')
+        .ok_or_else(|| anyhow!("Syntax Error: Expected '=' in expression '{}'", expr))?;
+
+    let col = expr[..eq_idx].trim().to_string();
+    let val = expr[eq_idx + 1..].trim().trim_matches('\'').to_string();
+    Ok((col, val))
+}
+
+/// Parses a WHERE clause with equality: `col = value` or `col = 'value'`.
+fn parse_where_equality(cond: &str) -> Result<(String, String)> {
+    parse_assignment(cond)
 }
 
 #[cfg(test)]
@@ -316,5 +370,46 @@ mod tests {
                 val: "21".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_insert_with_commas_in_values() {
+        let stmt = Parser::parse("INSERT INTO notes VALUES(1, 'hello, world')").unwrap();
+        if let Statement::Insert { values, .. } = stmt {
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0], "1");
+            assert_eq!(values[1], "hello, world");
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_with_escaped_quotes() {
+        let stmt = Parser::parse("INSERT INTO notes VALUES(1, 'it''s a test')").unwrap();
+        if let Statement::Insert { values, .. } = stmt {
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[1], "it's a test");
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn test_reject_reserved_table_name() {
+        let result = Parser::parse("CREATE TABLE __internal__(id INT)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_reserved_column_name() {
+        let result = Parser::parse("CREATE TABLE users(__secret INT)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_unterminated_string() {
+        let result = Parser::parse("INSERT INTO t VALUES(1, 'unclosed)");
+        assert!(result.is_err());
     }
 }

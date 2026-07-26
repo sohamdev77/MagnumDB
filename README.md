@@ -1,6 +1,6 @@
 # MagnumDB
 
-> Modern Open Source Embedded Database Engine
+> Modern Open Source Embedded Database Engine in Native Rust
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/sohamdev77/MagnumDB/ci.yml?branch=main)](https://github.com/sohamdev77/MagnumDB/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,16 +10,34 @@
 [![GitHub stars](https://img.shields.io/github/stars/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/issues)
 
-MagnumDB is a production-quality, open-source embedded database engine written in Rust. Designed to be both a high-performance database for real-world applications and a world-class educational resource for teaching database internals.
+MagnumDB is an open-source embedded key-value and SQL database engine written 100% from scratch in native Rust. Designed for performance, reliability, and modularity.
 
 ## Features
 
-- **Embedded & Fast**: Runs directly within your application with zero network overhead.
-- **ACID Transactions**: Single-writer transactions with WAL-backed durability.
-- **Crash Recovery**: Write-Ahead Log (WAL) ensures durability and consistency.
-- **B+ Tree Indexing**: Efficient storage and retrieval mechanism.
-- **SQL Support**: Built-in SQL parser and executor.
-- **Extensible**: Highly modular architecture.
+- **Embedded Engine**: Runs directly inside Rust binaries with zero external C/C++ dependencies.
+- **WAL Durability**: Write-Ahead Logging (WAL) with TxID framing and CRC32 checksums ensures crash recovery.
+- **B+ Tree Indexing**: Custom 4KB page disk pager, LRU buffer pool management, overflow pages, and leaf page recycling.
+- **SQL Execution Engine**: Built-in SQL AST parser, Volcano-style streaming query execution, range filters, and secondary indexes.
+- **Multi-Client TCP Server**: Async TCP server powered by Tokio with connection limits and idle timeouts.
+- **ACID Transactions**: Transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK` support.
+
+---
+
+## What's New in v0.2.0
+
+Version `0.2.0` represents a major production stability release resolving 14 core database engine issues:
+
+- 🛡️ **Durable Transactions**: Transaction writes properly track `tx_id` in WAL records, and committed pages are flushed and synced on `COMMIT`.
+- 🔒 **Page Serialization Protection**: B+ Tree page serialization includes bounds-checking guards against 4KB overflows.
+- 📐 **Documented Metadata Page Layout**: Page 0 layout standardized with magic bytes (`MGDB`), root page ID, free-list head, and checkpoint LSN.
+- ⚡ **Optimized Crash Recovery**: Startup WAL recovery uses checkpoint LSN filtering to avoid full file replay.
+- 🧹 **Secondary Index Maintenance**: `DELETE` and `UPDATE` SQL queries automatically update and clean up secondary indexes.
+- 👥 **Multi-PK Secondary Indexes**: Secondary indexes now support multiple primary keys per indexed value (1:N mapping).
+- 💬 **Enhanced SQL Parsing**: Supports string literals with spaces, commas (`'hello, world'`), and escaped quotes (`''`).
+- 🛑 **Identifier Validation**: Reserved system namespace (`__`) protects catalog tables from SQL injection.
+- 🌐 **Async TCP Server Hardening**: Connection semaphore limits (`max_connections`) and idle read timeouts.
+
+---
 
 ## Architecture
 
@@ -41,14 +59,7 @@ graph TD
     style E fill:#dfd,stroke:#333,stroke-width:2px
 ```
 
-MagnumDB is built with a clean, layered architecture separating the storage engine, transaction manager, and query execution. See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive.
-
-## Project Goals
-
-- **High Performance**: Target 100K+ reads/sec and 50K+ writes/sec.
-- **Educational Excellence**: Exceptionally well-documented codebase with beginner-friendly issues.
-- **Memory Efficient**: Predictable resource usage with zero unnecessary allocations.
-- **Safe**: Zero `unsafe` Rust code unless absolutely necessary.
+---
 
 ## Installation
 
@@ -56,10 +67,12 @@ Add MagnumDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-magnumdb = "0.1.0"
+magnumdb = "0.2.0"
 ```
 
-## Quick Start
+---
+
+## Quick Start (Embedded Key-Value)
 
 ```rust
 use magnumdb::{Database, Config};
@@ -68,101 +81,65 @@ fn main() -> anyhow::Result<()> {
     let config = Config::default().with_path("./my_database");
     let mut db = Database::open(config)?;
 
-    db.put(b"hello", b"world")?;
-    let val = db.get(b"hello")?;
+    // Embedded Key-Value API
+    db.put(b"user:100", b"Soham")?;
+    let val = db.get(b"user:100")?;
     
-    assert_eq!(val.unwrap(), b"world");
+    if let Some(bytes) = val {
+        println!("Found: {}", String::from_utf8_lossy(&bytes));
+    }
+
+    db.close()?;
     Ok(())
 }
 ```
 
-## Usage Examples
+---
 
-Check out the [examples/](examples/) directory for more comprehensive usage scenarios.
+## Embedded SQL Usage
 
-## Configuration
+```rust
+use magnumdb::{Database, Config};
+use magnumdb::sql::{Executor, Parser};
 
-MagnumDB can be configured programmatically or via a configuration file (e.g., `magnum.toml`).
+fn main() -> anyhow::Result<()> {
+    let config = Config::default().with_path("./sql_data");
+    let mut db = Database::open(config)?;
+    let mut exec = Executor::new(&mut db);
 
-```toml
-[storage]
-path = "./data"
-cache_size_mb = 256
+    exec.execute(Parser::parse("CREATE TABLE users(id INT, name TEXT)")?)?;
+    exec.execute(Parser::parse("INSERT INTO users VALUES(1, 'Alice')")?)?;
+    
+    let res = exec.execute(Parser::parse("SELECT * FROM users")?)?;
+    println!("{}", res);
 
-[wal]
-enabled = true
-sync_on_write = false
+    Ok(())
+}
 ```
 
-## CLI Commands
+---
 
-MagnumDB comes with a powerful command-line interface:
+## Publishing & Updating Crates.io
 
-- `magnum init` - Initialize a new database cluster
-- `magnum start` - Start the database server (for network mode)
-- `magnum stop` - Stop the server
-- `magnum shell` - Open the interactive database shell
-- `magnum backup` - Create a consistent backup
-- `magnum restore` - Restore from a backup
-- `magnum config` - View or validate configuration
-- `magnum version` - Display version information
-- `magnum benchmark` - Run performance tests
+To update or publish new versions to [crates.io](https://crates.io/crates/magnumdb):
 
-## Database Shell & SQL
+1. Login to crates.io via Cargo token:
+   ```bash
+   cargo login <YOUR_CRATES_IO_TOKEN>
+   ```
+2. Package and verify dry-run build:
+   ```bash
+   cargo package
+   ```
+3. Publish to Crates.io:
+   ```bash
+   cargo publish
+   ```
 
-Launch the interactive shell using `magnum shell`:
+---
 
-```sql
-magnum> CREATE TABLE users(id INT, name TEXT);
-Query OK.
+## Contributing & License
 
-magnum> INSERT INTO users VALUES(1, 'Soham');
-Query OK, 1 row inserted.
+We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md).
 
-magnum> SELECT * FROM users;
-+----+-------+
-| id | name  |
-+----+-------+
-|  1 | Soham |
-+----+-------+
-```
-
-## Performance Goals
-
-- **Throughput**: > 100K reads/sec, > 50K writes/sec on commodity SSDs.
-- **Latency**: Sub-millisecond read/write latency.
-- **Concurrency**: Single-writer, multi-reader (SWMR) locking using `parking_lot`.
-
-## Benchmarks
-
-
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for our detailed release plan.
-
-## Contributing
-
-We welcome contributions of all sizes! MagnumDB is specifically designed to be beginner-friendly. 
-
-- Check out our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
-- Look for issues tagged `good first issue` or `beginner`.
-
-## Community
-
-- [Code of Conduct](CODE_OF_CONDUCT.md)
-- Join our Discord (Link coming soon)
-
-## FAQ
-
-**Q: Is MagnumDB a drop-in replacement for SQLite?**  
-A: MagnumDB aims to provide similar embedded capabilities but focuses heavily on its specific educational and transactional roadmap. It is not currently a wire-compatible or API-compatible drop-in replacement.
-
-**Q: Why Rust?**  
-A: Rust provides the necessary control over memory and hardware to build a high-performance database while eliminating entire classes of memory safety bugs.
-
-
-
-## License
-
-MagnumDB is licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE).

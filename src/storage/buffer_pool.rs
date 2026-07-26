@@ -8,6 +8,10 @@ pub struct BufferPool {
     pager: Pager,
     /// Caches PageId -> (Page, is_dirty)
     cache: LruCache<PageId, (Page, bool)>,
+    /// Counter for auto-sync after N dirty writes
+    dirty_write_count: u32,
+    /// Sync every N dirty writes. 0 = disabled.
+    sync_interval: u32,
 }
 
 impl BufferPool {
@@ -17,7 +21,15 @@ impl BufferPool {
         Self {
             pager,
             cache: LruCache::new(cap),
+            dirty_write_count: 0,
+            sync_interval: 0,
         }
+    }
+
+    /// Creates a new BufferPool with periodic auto-sync enabled.
+    pub fn with_sync_interval(mut self, interval: u32) -> Self {
+        self.sync_interval = interval;
+        self
     }
 
     /// Fetches a page from the buffer pool or reads it from disk if not present.
@@ -36,6 +48,16 @@ impl BufferPool {
     /// Writes a page to the buffer pool, marking it as dirty.
     pub fn write_page(&mut self, page_id: PageId, page: &Page) -> anyhow::Result<()> {
         self.put_and_evict(page_id, page.clone(), true)?;
+
+        // Auto-sync after N dirty writes
+        if self.sync_interval > 0 {
+            self.dirty_write_count += 1;
+            if self.dirty_write_count >= self.sync_interval {
+                self.flush_and_sync()?;
+                self.dirty_write_count = 0;
+            }
+        }
+
         Ok(())
     }
 
@@ -96,6 +118,14 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Flushes all dirty pages and fsyncs the data file to disk.
+    /// This guarantees all buffered writes are durable.
+    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+        self.flush_all()?;
+        self.pager.sync()?;
+        Ok(())
+    }
+
     /// Syncs the pager to disk.
     pub fn sync(&mut self) -> anyhow::Result<()> {
         self.pager.sync()?;
@@ -105,6 +135,11 @@ impl BufferPool {
     /// Returns the total number of allocated pages on disk.
     pub fn get_num_pages(&self) -> u32 {
         self.pager.num_pages
+    }
+
+    /// Returns a mutable reference to the underlying pager (for checkpoint LSN access).
+    pub fn pager_mut(&mut self) -> &mut Pager {
+        &mut self.pager
     }
 }
 
@@ -149,6 +184,30 @@ mod tests {
         let mut direct_pager = Pager::open(&path)?;
         let read_page0 = direct_pager.read_page(id0)?;
         assert_eq!(read_page0.data[0], 100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_buffer_pool_flush_and_sync() -> anyhow::Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_path_buf();
+
+        let pager = Pager::open(&path)?;
+        let mut pool = BufferPool::new(pager, 10);
+
+        let id = pool.allocate_page()?;
+        let mut page = Page::default();
+        page.data[0] = 77;
+        pool.write_page(id, &page)?;
+
+        // Flush and sync
+        pool.flush_and_sync()?;
+
+        // Verify on disk
+        let mut direct_pager = Pager::open(&path)?;
+        let read_page = direct_pager.read_page(id)?;
+        assert_eq!(read_page.data[0], 77);
 
         Ok(())
     }

@@ -7,6 +7,7 @@ fn setup_executor(dir: &tempfile::TempDir) -> (Database, Config) {
     let mut config = Config::default();
     config.storage.path = dir.path().to_path_buf();
     config.wal.enabled = false;
+    config.storage.sync_interval = 0;
     let db = Database::open(config.clone()).unwrap();
     (db, config)
 }
@@ -79,4 +80,21 @@ fn test_transactions() {
         .execute(Parser::parse("SELECT * FROM users").unwrap())
         .unwrap();
     assert!(res.contains("Bob"));
+}
+
+#[test]
+fn test_insert_with_commas_in_values() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE notes(id INT, content TEXT)").unwrap())
+        .unwrap();
+    exec.execute(Parser::parse("INSERT INTO notes VALUES(1, 'hello, world')").unwrap())
+        .unwrap();
+
+    let res = exec
+        .execute(Parser::parse("SELECT * FROM notes").unwrap())
+        .unwrap();
+    assert!(res.contains("hello, world"));
 }

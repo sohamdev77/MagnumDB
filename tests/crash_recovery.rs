@@ -9,6 +9,7 @@ fn test_wal_crash_recovery() {
     config.storage.path = dir.path().to_path_buf();
     config.wal.enabled = true;
     config.wal.sync_on_write = true;
+    config.storage.sync_interval = 0;
 
     // Write some data and simulate a crash by dropping the DB without closing
     {

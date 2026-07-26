@@ -14,6 +14,9 @@ pub struct Config {
 pub struct StorageConfig {
     pub path: PathBuf,
     pub cache_size_mb: usize,
+    /// Number of writes between automatic buffer pool syncs. 0 = disabled.
+    #[serde(default)]
+    pub sync_interval: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,20 @@ pub struct WalConfig {
 pub struct NetworkConfig {
     pub host: String,
     pub port: u16,
+    /// Maximum number of concurrent client connections.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Idle timeout in seconds before a connection is dropped. 0 = no timeout.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_max_connections() -> usize {
+    128
+}
+
+fn default_idle_timeout() -> u64 {
+    30
 }
 
 impl Default for Config {
@@ -34,6 +51,7 @@ impl Default for Config {
             storage: StorageConfig {
                 path: PathBuf::from("./data"),
                 cache_size_mb: 256,
+                sync_interval: 1000,
             },
             wal: WalConfig {
                 enabled: true,
@@ -42,6 +60,8 @@ impl Default for Config {
             network: NetworkConfig {
                 host: "127.0.0.1".to_string(),
                 port: 7432,
+                max_connections: 128,
+                idle_timeout_secs: 30,
             },
         }
     }
