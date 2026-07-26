@@ -9,7 +9,7 @@ repository = "https://github.com/sohamdev77/MagnumDB"
 documentation = "https://docs.rs/magnumdb"
 readme = "README.md"
 keywords = ["database", "embedded", "btree", "sql", "storage-engine"]
-categories = ["database-implementations", "embedded-databases"]
+categories = ["database-implementations", "database"]
 
 [dependencies]
 # Error handling
