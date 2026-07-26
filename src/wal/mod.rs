@@ -1,21 +1,37 @@
 //! Write-Ahead Log (WAL) module.
 //!
-//! Provides durability by logging all mutations before they are applied to the main data files.
+//! Provides durability by logging all mutations and transactions before they are applied to the main data files.
+//! Features LSN tracking, TxID framing, and CRC32 checksum integrity checks.
 
+use crc32fast::Hasher;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Represents an operation logged in the WAL.
+#[derive(Debug, Clone, PartialEq)]
 pub enum WalEntry {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
+}
+
+/// Operation type tags in the WAL payload.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalOpType {
+    Put = 1,
+    Delete = 2,
+    Begin = 3,
+    Commit = 4,
+    Rollback = 5,
 }
 
 /// The Write-Ahead Log structure.
 pub struct WriteAheadLog {
     file: File,
     _path: PathBuf,
+    current_lsn: u64,
 }
 
 impl WriteAheadLog {
@@ -28,91 +44,197 @@ impl WriteAheadLog {
             .append(true)
             .open(&path)?;
 
-        Ok(Self { file, _path: path })
+        Ok(Self {
+            file,
+            _path: path,
+            current_lsn: 0,
+        })
     }
 
-    /// Reads all entries from the WAL for crash recovery.
+    /// Reads all committed entries from the WAL for crash recovery, verifying CRC32 checksums.
     pub fn recover(&mut self) -> io::Result<Vec<WalEntry>> {
-        let mut entries = Vec::new();
+        let mut committed_entries = Vec::new();
+        let mut active_txs: HashMap<u64, Vec<WalEntry>> = HashMap::new();
         self.file.seek(SeekFrom::Start(0))?;
 
+        let mut max_lsn = 0u64;
+
         loop {
-            let mut type_buf = [0u8; 1];
-            if let Err(e) = self.file.read_exact(&mut type_buf) {
+            // Header: [LSN: 8B][TxID: 8B][Type: 1B][Len: 4B] -> Total 21 bytes
+            let mut header_buf = [0u8; 21];
+            if let Err(e) = self.file.read_exact(&mut header_buf) {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     break; // Clean EOF
                 }
-                break; // Partial write / crash mid-write
+                break; // Corrupted / partial write at EOF
             }
 
-            match type_buf[0] {
+            let lsn = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+            let tx_id = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let op_code = header_buf[16];
+            let payload_len = u32::from_le_bytes(header_buf[17..21].try_into().unwrap()) as usize;
+
+            let mut payload = vec![0u8; payload_len];
+            if self.file.read_exact(&mut payload).is_err() {
+                break; // Corrupted / partial write
+            }
+
+            let mut crc_buf = [0u8; 4];
+            if self.file.read_exact(&mut crc_buf).is_err() {
+                break;
+            }
+            let expected_crc = u32::from_le_bytes(crc_buf);
+
+            // Calculate checksum over header + payload
+            let mut hasher = Hasher::new();
+            hasher.update(&header_buf);
+            hasher.update(&payload);
+            let computed_crc = hasher.finalize();
+
+            if computed_crc != expected_crc {
+                // Checksum mismatch -> log corruption or incomplete write
+                break;
+            }
+
+            if lsn > max_lsn {
+                max_lsn = lsn;
+            }
+
+            match op_code {
                 1 => {
-                    // PUT
-                    let mut len_buf = [0u8; 4];
-                    if self.file.read_exact(&mut len_buf).is_err() {
+                    // PUT: [KeyLen: 4B][Key][ValLen: 4B][Val]
+                    if payload.len() < 8 {
                         break;
                     }
-                    let key_len = u32::from_le_bytes(len_buf) as usize;
-
-                    let mut key = vec![0; key_len];
-                    if self.file.read_exact(&mut key).is_err() {
+                    let klen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                    if payload.len() < 4 + klen + 4 {
                         break;
                     }
-
-                    if self.file.read_exact(&mut len_buf).is_err() {
+                    let key = payload[4..4 + klen].to_vec();
+                    let vlen_offset = 4 + klen;
+                    let vlen = u32::from_le_bytes(
+                        payload[vlen_offset..vlen_offset + 4].try_into().unwrap(),
+                    ) as usize;
+                    if payload.len() < vlen_offset + 4 + vlen {
                         break;
                     }
-                    let val_len = u32::from_le_bytes(len_buf) as usize;
+                    let val = payload[vlen_offset + 4..vlen_offset + 4 + vlen].to_vec();
 
-                    let mut val = vec![0; val_len];
-                    if self.file.read_exact(&mut val).is_err() {
-                        break;
+                    let entry = WalEntry::Put(key, val);
+                    if tx_id == 0 {
+                        committed_entries.push(entry);
+                    } else {
+                        active_txs.entry(tx_id).or_default().push(entry);
                     }
-
-                    entries.push(WalEntry::Put(key, val));
                 }
                 2 => {
-                    // DELETE
-                    let mut len_buf = [0u8; 4];
-                    if self.file.read_exact(&mut len_buf).is_err() {
+                    // DELETE: [KeyLen: 4B][Key]
+                    if payload.len() < 4 {
                         break;
                     }
-                    let key_len = u32::from_le_bytes(len_buf) as usize;
-
-                    let mut key = vec![0; key_len];
-                    if self.file.read_exact(&mut key).is_err() {
+                    let klen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                    if payload.len() < 4 + klen {
                         break;
                     }
+                    let key = payload[4..4 + klen].to_vec();
 
-                    entries.push(WalEntry::Delete(key));
+                    let entry = WalEntry::Delete(key);
+                    if tx_id == 0 {
+                        committed_entries.push(entry);
+                    } else {
+                        active_txs.entry(tx_id).or_default().push(entry);
+                    }
                 }
-                _ => break, // Corrupted type, stop replay
+                3 => {
+                    // BEGIN
+                    if tx_id > 0 {
+                        active_txs.insert(tx_id, Vec::new());
+                    }
+                }
+                4 => {
+                    // COMMIT
+                    if let Some(entries) = active_txs.remove(&tx_id) {
+                        committed_entries.extend(entries);
+                    }
+                }
+                5 => {
+                    // ROLLBACK / ABORT
+                    active_txs.remove(&tx_id);
+                }
+                _ => break, // Unknown opcode
             }
         }
 
-        // Seek to end so subsequent appends work correctly
+        self.current_lsn = max_lsn;
         self.file.seek(SeekFrom::End(0))?;
-        Ok(entries)
+        Ok(committed_entries)
+    }
+
+    fn write_record(&mut self, tx_id: u64, op_type: WalOpType, payload: &[u8]) -> io::Result<u64> {
+        self.current_lsn += 1;
+        let lsn = self.current_lsn;
+
+        let mut header = [0u8; 21];
+        header[0..8].copy_from_slice(&lsn.to_le_bytes());
+        header[8..16].copy_from_slice(&tx_id.to_le_bytes());
+        header[16] = op_type as u8;
+        header[17..21].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        let mut hasher = Hasher::new();
+        hasher.update(&header);
+        hasher.update(payload);
+        let crc = hasher.finalize();
+
+        self.file.write_all(&header)?;
+        self.file.write_all(payload)?;
+        self.file.write_all(&crc.to_le_bytes())?;
+
+        Ok(lsn)
     }
 
     /// Appends a PUT operation to the WAL.
-    pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        // Simple binary format: [Type: 1 byte][Key Len: 4 bytes][Key][Value Len: 4 bytes][Value]
-        self.file.write_all(&[1])?; // 1 = PUT
-        self.file.write_all(&(key.len() as u32).to_le_bytes())?;
-        self.file.write_all(key)?;
-        self.file.write_all(&(value.len() as u32).to_le_bytes())?;
-        self.file.write_all(value)?;
-        Ok(())
+    pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        self.append_tx_put(0, key, value)
+    }
+
+    /// Appends a transactional PUT operation to the WAL.
+    pub fn append_tx_put(&mut self, tx_id: u64, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        let mut payload = Vec::with_capacity(4 + key.len() + 4 + value.len());
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value);
+
+        self.write_record(tx_id, WalOpType::Put, &payload)
     }
 
     /// Appends a DELETE operation to the WAL.
-    pub fn append_delete(&mut self, key: &[u8]) -> io::Result<()> {
-        // Format: [Type: 1 byte][Key Len: 4 bytes][Key]
-        self.file.write_all(&[2])?; // 2 = DELETE
-        self.file.write_all(&(key.len() as u32).to_le_bytes())?;
-        self.file.write_all(key)?;
-        Ok(())
+    pub fn append_delete(&mut self, key: &[u8]) -> io::Result<u64> {
+        self.append_tx_delete(0, key)
+    }
+
+    /// Appends a transactional DELETE operation to the WAL.
+    pub fn append_tx_delete(&mut self, tx_id: u64, key: &[u8]) -> io::Result<u64> {
+        let mut payload = Vec::with_capacity(4 + key.len());
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(key);
+
+        self.write_record(tx_id, WalOpType::Delete, &payload)
+    }
+
+    /// Logs BEGIN transaction record.
+    pub fn append_begin(&mut self, tx_id: u64) -> io::Result<u64> {
+        self.write_record(tx_id, WalOpType::Begin, &[])
+    }
+
+    /// Logs COMMIT transaction record.
+    pub fn append_commit(&mut self, tx_id: u64) -> io::Result<u64> {
+        self.write_record(tx_id, WalOpType::Commit, &[])
+    }
+
+    /// Logs ROLLBACK transaction record.
+    pub fn append_rollback(&mut self, tx_id: u64) -> io::Result<u64> {
+        self.write_record(tx_id, WalOpType::Rollback, &[])
     }
 
     /// Syncs the WAL to disk to ensure durability.
@@ -124,6 +246,8 @@ impl WriteAheadLog {
     pub fn checkpoint(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_data()
+        self.file.sync_data()?;
+        self.current_lsn = 0;
+        Ok(())
     }
 }
