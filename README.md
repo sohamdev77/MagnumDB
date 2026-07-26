@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust Version](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org/)
 [![Crates.io Version](https://img.shields.io/crates/v/magnumdb.svg)](https://crates.io/crates/magnumdb)
+[![Documentation](https://docs.rs/magnumdb/badge.svg)](https://docs.rs/magnumdb)
 [![GitHub stars](https://img.shields.io/github/stars/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/stargazers)
 [![GitHub issues](https://img.shields.io/github/issues/sohamdev77/MagnumDB.svg)](https://github.com/sohamdev77/MagnumDB/issues)
 
