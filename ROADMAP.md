@@ -1,48 +1,56 @@
 # MagnumDB Roadmap
 
-This document outlines the planned roadmap for MagnumDB. We aim to build incrementally, ensuring each subsystem is robust and heavily tested before proceeding.
+This document outlines the roadmap and current completion state for MagnumDB.
 
 ## Phase 1: Core Storage Engine
 - [x] Key-Value Store
 - [x] Persistent Storage
-- [x] WAL (Write Ahead Log)
-- [x] Crash Recovery
-- [x] CLI
-- [x] Config File
-- [x] Logging
+- [x] Page Free-List Space Recycling
+- [x] Write-Ahead Log (WAL with LSN & CRC32 Checksums)
+- [x] Crash Recovery (Checksum-Verified Replay)
+- [x] CLI (`init`, `start`, `backup`, `restore`, `shell`, `benchmark`)
+- [x] Config File (`toml` parsing & environment handling)
+- [x] Structured Logging (`env_logger`)
 
-## Phase 2: Indexing & Caching
-- [ ] B+ Tree Index
-- [ ] Storage Engine enhancements
-- [ ] Cache Manager
-- [ ] Compression
+## Phase 2: Indexing & Storage Engine
+- [x] B+ Tree Index (Fixed 4KB Page Serialization)
+- [x] Prefix Range Scanning (`scan_prefix`)
+- [x] Overflow Page Chaining for Large Records (> 4KB)
+- [x] Secondary Indexing (`CREATE INDEX`)
+- [x] LRU Buffer Pool Page Manager
 
-## Phase 3: SQL Interface
-- [ ] SQL Parser
-- [ ] Query Execution Engine
-- [ ] Supported commands: `CREATE TABLE`, `INSERT`, `SELECT`, `DELETE`, `UPDATE`, `DROP TABLE`
+## Phase 3: SQL Interface & Query Engine
+- [x] SQL Parser (DDL, DML, Range Queries, Aggregates)
+- [x] Volcano Streaming Execution Iterator Engine (`SeqScanExec`, `FilterExec`, `AggregateExec`)
+- [x] Supported Commands: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `DROP TABLE`, `SHOW TABLES`
+- [x] Aggregate Functions: `COUNT(*)`, `SUM(col)`, `AVG(col)`
+- [x] Cost-Based Query Optimizer (CBO strategy selection)
 
 ## Phase 4: Concurrency & Transactions
-- [ ] ACID Transactions
-- [ ] MVCC (Multi-Version Concurrency Control)
-- [ ] Locks and isolation levels
+- [x] Write-Ahead Log Transaction Framing (`BEGIN`, `COMMIT`, `ROLLBACK`)
+- [x] Single-Writer WAL Transaction Durability
+- [ ] Multi-Version Concurrency Control (MVCC tuple headers)
+- [ ] Fine-Grained Page Latching (`RwLock<Page>`)
 
 ## Phase 5: Client-Server Architecture
-- [ ] TCP Server
-- [ ] Multiple Clients support
-- [ ] Authentication
-- [ ] User Management
+- [x] Async Multi-Client TCP Server (Tokio runtime)
+- [x] PostgreSQL Wire Protocol (`pgwire` handler for `StartupMessage`, `Query`, `ReadyForQuery`)
+- [ ] User Authentication & Password Hashing
+- [ ] Role-Based Access Control (RBAC)
 
 ## Phase 6: Distributed Mode
-- [ ] Replication
+- [ ] Replication Engine
 - [ ] Leader Election
-- [ ] Raft Consensus integration
-- [ ] Cluster Mode
+- [ ] Raft Consensus Integration
+- [ ] Consistent Hash Sharding & Cluster Mode
 
-## Phase 7: APIs and Observability
-- [ ] REST API
-- [ ] gRPC API
-- [ ] Metrics Dashboard
+## Phase 7: Operational Tooling & Observability
+- [x] Hot Backup & Physical Snapshot Recovery
+- [x] High-Throughput Engine Benchmarking CLI
+- [ ] Prometheus Metrics Exporter
+- [ ] gRPC API Interface
 
-## Known Limitations
-- B-Tree deletions currently do not rebalance or merge underflowing pages. Pages are left under-filled, which may result in a larger file size than necessary. This is a known limitation that will be addressed in future phases.
+## Current Architecture Highlights
+- **Zero Space Leak Paging**: Deleted pages are returned to Page 0's Free-List chain and reused on subsequent allocations.
+- **WAL Data Protection**: Every WAL frame is checksummed with CRC32. Corrupted log bytes or partial writes at crash time are automatically caught and discarded safely.
+- **Large Record Overflow**: Records larger than a single page are chained across dedicated overflow pages and freed upon record deletion.
