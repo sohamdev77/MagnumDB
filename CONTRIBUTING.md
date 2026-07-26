@@ -32,6 +32,15 @@ First off, thank you for considering contributing to MagnumDB! We actively encou
 - Use `anyhow` for application-level error handling.
 - Use `log` and `env_logger` for structured logging.
 
+## Maintainer Release Guide
+
+For repository maintainers publishing a new version to Crates.io:
+
+1. Update the version number in `Cargo.toml`.
+2. Login to Crates.io (only needed once): `cargo login YOUR_TOKEN`
+3. Verify dry-run packaging: `cargo package`
+4. Publish the crate: `cargo publish`
+
 ## Need Help?
 
 Reach out to the maintainers on our Discord or via GitHub Discussions. We are happy to help you navigate the codebase!

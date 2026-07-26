@@ -119,25 +119,6 @@ fn main() -> anyhow::Result<()> {
 
 ---
 
-## Publishing & Updating Crates.io
-
-To update or publish new versions to [crates.io](https://crates.io/crates/magnumdb):
-
-1. Login to crates.io via Cargo token:
-   ```bash
-   cargo login <YOUR_CRATES_IO_TOKEN>
-   ```
-2. Package and verify dry-run build:
-   ```bash
-   cargo package
-   ```
-3. Publish to Crates.io:
-   ```bash
-   cargo publish
-   ```
-
----
-
 ## Contributing & License
 
 We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md).
