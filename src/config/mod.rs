@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub storage: StorageConfig,
     pub wal: WalConfig,
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,12 @@ pub struct WalConfig {
     pub sync_on_write: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    pub host: String,
+    pub port: u16,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -31,6 +38,10 @@ impl Default for Config {
             wal: WalConfig {
                 enabled: true,
                 sync_on_write: false,
+            },
+            network: NetworkConfig {
+                host: "127.0.0.1".to_string(),
+                port: 7432,
             },
         }
     }

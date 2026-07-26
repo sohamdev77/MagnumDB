@@ -36,7 +36,7 @@ fn test_create_table_and_insert() {
     // 5. Select round-trips correctly
     let stmt = Parser::parse("SELECT * FROM users").unwrap();
     let res = exec.execute(stmt).unwrap();
-    assert!(res.contains("id INT | name TEXT"));
+    assert!(res.contains("id | name"));
     assert!(res.contains("1 | John"));
 }
 

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod network;
 pub mod sql;
 pub mod storage;
 pub mod wal;
