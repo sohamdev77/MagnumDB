@@ -2,10 +2,14 @@
 name = "magnumdb"
 version = "0.1.0"
 edition = "2021"
-authors = ["MagnumDB Contributors"]
-description = "A modern open-source embedded database engine"
+authors = ["Soham Das <sohom2682009@gmail.com>"]
+description = "High-performance embeddable database engine in Rust with B+ Tree storage, WAL durability, Volcano query engine, and Postgres wire protocol support."
 license = "MIT"
 repository = "https://github.com/sohamdev77/MagnumDB"
+documentation = "https://docs.rs/magnumdb"
+readme = "README.md"
+keywords = ["database", "embedded", "btree", "sql", "storage-engine"]
+categories = ["database-implementations", "embedded-databases"]
 
 [dependencies]
 # Error handling
