@@ -282,6 +282,73 @@ impl<'a> Executor<'a> {
 
                 Ok(output)
             }
+            Statement::SelectRange {
+                table_name,
+                column,
+                op,
+                val,
+            } => {
+                let schema_bytes = self
+                    .get_schema_bytes(&table_name)?
+                    .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+                let schema_val = String::from_utf8(schema_bytes)?;
+                let col_defs: Vec<&str> = schema_val.split(',').collect();
+                let col_names: Vec<&str> = col_defs
+                    .iter()
+                    .map(|c| c.split_whitespace().next().unwrap_or(c.trim()))
+                    .collect();
+
+                let col_idx = col_names
+                    .iter()
+                    .position(|c| c == &column)
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", column))?;
+
+                let header = col_names.join(" | ");
+                let prefix = format!("{}:", table_name);
+                let records = self.db.scan_prefix(prefix.as_bytes())?;
+
+                let mut output =
+                    format!("+-----------------+\n| {} |\n+-----------------+\n", header);
+                let mut count = 0;
+
+                for (_key, rval) in records {
+                    let decoded = decode_values(&rval)?;
+                    if col_idx < decoded.len() {
+                        let row_v = &decoded[col_idx];
+                        let num_row = row_v.parse::<f64>();
+                        let num_target = val.parse::<f64>();
+
+                        let matches = if let (Ok(r_num), Ok(t_num)) = (num_row, num_target) {
+                            match op.as_str() {
+                                ">=" => r_num >= t_num,
+                                "<=" => r_num <= t_num,
+                                ">" => r_num > t_num,
+                                "<" => r_num < t_num,
+                                _ => false,
+                            }
+                        } else {
+                            match op.as_str() {
+                                ">=" => row_v >= &val,
+                                "<=" => row_v <= &val,
+                                ">" => row_v > &val,
+                                "<" => row_v < &val,
+                                _ => false,
+                            }
+                        };
+
+                        if matches {
+                            let formatted_row = decoded.join(" | ");
+                            output.push_str(&format!("| {} |\n", formatted_row));
+                            count += 1;
+                        }
+                    }
+                }
+
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", count));
+
+                Ok(output)
+            }
             Statement::SelectAggregate {
                 func,
                 column,
@@ -557,5 +624,41 @@ mod tests {
         let sec_key = b"__secidx__:users:name:Charlie";
         let pk = db.get(sec_key).unwrap().unwrap();
         assert_eq!(pk, b"1");
+    }
+
+    #[test]
+    fn test_executor_select_range() {
+        let mut db = setup_db();
+        let mut exec = Executor::new(&mut db);
+
+        exec.execute(Statement::CreateTable {
+            table_name: "users".to_string(),
+            columns: vec!["id INT".to_string(), "age INT".to_string()],
+        })
+        .unwrap();
+
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["1".to_string(), "20".to_string()],
+        })
+        .unwrap();
+
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["2".to_string(), "30".to_string()],
+        })
+        .unwrap();
+
+        let res = exec
+            .execute(Statement::SelectRange {
+                table_name: "users".to_string(),
+                column: "age".to_string(),
+                op: ">=".to_string(),
+                val: "25".to_string(),
+            })
+            .unwrap();
+
+        assert!(res.contains("30"));
+        assert!(!res.contains("20"));
     }
 }

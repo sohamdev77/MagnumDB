@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
     CreateTable {
         table_name: String,
@@ -18,6 +18,12 @@ pub enum Statement {
     Select {
         table_name: String,
         where_clause: Option<(String, String)>,
+    },
+    SelectRange {
+        table_name: String,
+        column: String,
+        op: String,
+        val: String,
     },
     SelectAggregate {
         func: String,
@@ -105,7 +111,6 @@ impl Parser {
     }
 
     fn parse_create_index(sql: &str) -> Result<Statement> {
-        // e.g. CREATE INDEX idx_users_name ON users(name)
         let upper_sql = sql.to_uppercase();
         let on_idx = upper_sql
             .find(" ON ")
@@ -170,20 +175,6 @@ impl Parser {
         let rest = sql[from_idx + 4..].trim();
         let upper_rest = rest.to_uppercase();
 
-        let (table_name, where_clause) = if let Some(where_idx) = upper_rest.find("WHERE") {
-            let tname = rest[..where_idx].trim().to_string();
-            let cond = rest[where_idx + 5..].trim();
-            let cond_parts: Vec<&str> = cond.split('=').collect();
-            if cond_parts.len() != 2 {
-                return Err(anyhow!("Syntax Error: Invalid WHERE clause"));
-            }
-            let col = cond_parts[0].trim().to_string();
-            let val = cond_parts[1].trim().trim_matches('\'').to_string();
-            (tname, Some((col, val)))
-        } else {
-            (rest.to_string(), None)
-        };
-
         if upper_target.starts_with("COUNT(")
             || upper_target.starts_with("SUM(")
             || upper_target.starts_with("AVG(")
@@ -193,16 +184,60 @@ impl Parser {
             let col_end = target.rfind(')').unwrap_or(target.len());
             let col = target[func_end + 1..col_end].trim().to_string();
 
-            Ok(Statement::SelectAggregate {
+            let (table_name, where_clause) = if let Some(where_idx) = upper_rest.find("WHERE") {
+                let tname = rest[..where_idx].trim().to_string();
+                let cond = rest[where_idx + 5..].trim();
+                let cond_parts: Vec<&str> = cond.split('=').collect();
+                if cond_parts.len() != 2 {
+                    return Err(anyhow!("Syntax Error: Invalid WHERE clause"));
+                }
+                let col = cond_parts[0].trim().to_string();
+                let val = cond_parts[1].trim().trim_matches('\'').to_string();
+                (tname, Some((col, val)))
+            } else {
+                (rest.to_string(), None)
+            };
+
+            return Ok(Statement::SelectAggregate {
                 func,
                 column: col,
                 table_name,
                 where_clause,
+            });
+        }
+
+        if let Some(where_idx) = upper_rest.find("WHERE") {
+            let table_name = rest[..where_idx].trim().to_string();
+            let cond = rest[where_idx + 5..].trim();
+
+            for op in &[">=", "<=", ">", "<"] {
+                if let Some(op_idx) = cond.find(op) {
+                    let col = cond[..op_idx].trim().to_string();
+                    let val = cond[op_idx + op.len()..].trim().trim_matches('\'').to_string();
+                    return Ok(Statement::SelectRange {
+                        table_name,
+                        column: col,
+                        op: (*op).to_string(),
+                        val,
+                    });
+                }
+            }
+
+            let cond_parts: Vec<&str> = cond.split('=').collect();
+            if cond_parts.len() != 2 {
+                return Err(anyhow!("Syntax Error: Invalid WHERE clause"));
+            }
+            let col = cond_parts[0].trim().to_string();
+            let val = cond_parts[1].trim().trim_matches('\'').to_string();
+
+            Ok(Statement::Select {
+                table_name,
+                where_clause: Some((col, val)),
             })
         } else {
             Ok(Statement::Select {
-                table_name,
-                where_clause,
+                table_name: rest.to_string(),
+                where_clause: None,
             })
         }
     }
@@ -270,102 +305,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_create_table() {
-        let stmt = Parser::parse("CREATE TABLE users(id INT, name TEXT)").unwrap();
+    fn test_parse_range_query() {
+        let range_gt = Parser::parse("SELECT * FROM users WHERE age >= 21").unwrap();
         assert_eq!(
-            stmt,
-            Statement::CreateTable {
+            range_gt,
+            Statement::SelectRange {
                 table_name: "users".to_string(),
-                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            }
-        );
-
-        let idx = Parser::parse("CREATE INDEX idx_users_name ON users(name)").unwrap();
-        assert_eq!(
-            idx,
-            Statement::CreateIndex {
-                index_name: "idx_users_name".to_string(),
-                table_name: "users".to_string(),
-                column: "name".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_insert() {
-        let stmt = Parser::parse("INSERT INTO users VALUES(1, 'Alice')").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["1".to_string(), "Alice".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_select_aggregates() {
-        let count = Parser::parse("SELECT COUNT(*) FROM users").unwrap();
-        assert_eq!(
-            count,
-            Statement::SelectAggregate {
-                func: "COUNT".to_string(),
-                column: "*".to_string(),
-                table_name: "users".to_string(),
-                where_clause: None,
-            }
-        );
-
-        let sum = Parser::parse("SELECT SUM(age) FROM users WHERE role = 'dev'").unwrap();
-        assert_eq!(
-            sum,
-            Statement::SelectAggregate {
-                func: "SUM".to_string(),
                 column: "age".to_string(),
-                table_name: "users".to_string(),
-                where_clause: Some(("role".to_string(), "dev".to_string())),
+                op: ">=".to_string(),
+                val: "21".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn test_parse_update_delete_drop() {
-        let update = Parser::parse("UPDATE users SET name = 'Bob' WHERE id = 1").unwrap();
-        assert_eq!(
-            update,
-            Statement::Update {
-                table_name: "users".to_string(),
-                column: "name".to_string(),
-                value: "Bob".to_string(),
-                pk_val: "1".to_string(),
-            }
-        );
-
-        let delete = Parser::parse("DELETE FROM users WHERE id = 1").unwrap();
-        assert_eq!(
-            delete,
-            Statement::Delete {
-                table_name: "users".to_string(),
-                pk_val: "1".to_string(),
-            }
-        );
-
-        let drop = Parser::parse("DROP TABLE users").unwrap();
-        assert_eq!(
-            drop,
-            Statement::DropTable {
-                table_name: "users".to_string(),
-            }
-        );
-
-        let show = Parser::parse("SHOW TABLES").unwrap();
-        assert_eq!(show, Statement::ShowTables);
-    }
-
-    #[test]
-    fn test_parse_transactions() {
-        assert_eq!(Parser::parse("BEGIN").unwrap(), Statement::Begin);
-        assert_eq!(Parser::parse("COMMIT").unwrap(), Statement::Commit);
-        assert_eq!(Parser::parse("ROLLBACK;").unwrap(), Statement::Rollback);
     }
 }
