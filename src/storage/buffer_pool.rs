@@ -44,6 +44,13 @@ impl BufferPool {
         Ok(page_id)
     }
 
+    /// Frees a page on disk and removes it from the cache.
+    pub fn free_page(&mut self, page_id: PageId) -> anyhow::Result<()> {
+        self.cache.pop(&page_id);
+        self.pager.free_page(page_id)?;
+        Ok(())
+    }
+
     /// Helper function to put a page in the cache and evict the oldest if full.
     fn put_and_evict(&mut self, page_id: PageId, page: Page, is_dirty: bool) -> anyhow::Result<()> {
         if self.cache.len() == self.cache.cap().get() {

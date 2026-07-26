@@ -80,6 +80,11 @@ impl Database {
         self.index.scan()
     }
 
+    /// Scans key-value pairs matching a prefix efficiently.
+    pub fn scan_prefix(&mut self, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.index.scan_prefix(prefix)
+    }
+
     /// Deletes a key from the database.
     pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
         if let Some(wal) = &mut self.wal {
@@ -90,6 +95,39 @@ impl Database {
         }
 
         self.index.delete(key)?;
+        Ok(())
+    }
+
+    /// Logs BEGIN transaction to WAL.
+    pub fn begin_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal) = &mut self.wal {
+            wal.append_begin(tx_id)?;
+            if self.config.wal.sync_on_write {
+                wal.sync()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs COMMIT transaction to WAL.
+    pub fn commit_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal) = &mut self.wal {
+            wal.append_commit(tx_id)?;
+            if self.config.wal.sync_on_write {
+                wal.sync()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs ROLLBACK transaction to WAL.
+    pub fn rollback_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal) = &mut self.wal {
+            wal.append_rollback(tx_id)?;
+            if self.config.wal.sync_on_write {
+                wal.sync()?;
+            }
+        }
         Ok(())
     }
 

@@ -39,18 +39,24 @@ impl Pager {
 
         let metadata = file.metadata()?;
         let file_size = metadata.len();
-
         let num_pages = (file_size / (PAGE_SIZE as u64)) as u32;
 
-        Ok(Self { file, num_pages })
+        let mut pager = Self { file, num_pages };
+
+        if pager.num_pages == 0 {
+            let mut meta_page = Page::default();
+            // free_list_head = u32::MAX
+            meta_page.data[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            pager.write_page(0, &meta_page)?;
+        }
+
+        Ok(pager)
     }
 
     /// Reads a page from disk into memory.
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
         let mut page = Page::default();
 
-        // If the page is out of bounds, return an empty page to allow the caller to handle allocation.
-        // In a strict implementation, reading out of bounds might be an error.
         if page_id >= self.num_pages {
             return Ok(page);
         }
@@ -68,7 +74,6 @@ impl Pager {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&page.data)?;
 
-        // Update the number of pages if we appended
         if page_id >= self.num_pages {
             self.num_pages = page_id + 1;
         }
@@ -76,12 +81,49 @@ impl Pager {
         Ok(())
     }
 
-    /// Appends a new blank page to the file and returns its PageId.
+    /// Appends a new blank page or reuses a freed page from the free list.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
-        let page_id = self.num_pages;
-        let blank_page = Page::default();
-        self.write_page(page_id, &blank_page)?;
-        Ok(page_id)
+        let meta_page = self.read_page(0)?;
+        let free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap());
+
+        if free_head != u32::MAX && free_head < self.num_pages && free_head != 0 {
+            let free_page = self.read_page(free_head)?;
+            let next_free = u32::from_le_bytes(free_page.data[0..4].try_into().unwrap());
+
+            let mut updated_meta = meta_page;
+            updated_meta.data[4..8].copy_from_slice(&next_free.to_le_bytes());
+            self.write_page(0, &updated_meta)?;
+
+            let blank_page = Page::default();
+            self.write_page(free_head, &blank_page)?;
+
+            Ok(free_head)
+        } else {
+            let page_id = self.num_pages;
+            let blank_page = Page::default();
+            self.write_page(page_id, &blank_page)?;
+            Ok(page_id)
+        }
+    }
+
+    /// Returns a page to the free list for future allocation.
+    pub fn free_page(&mut self, page_id: PageId) -> io::Result<()> {
+        if page_id == 0 || page_id >= self.num_pages {
+            return Ok(());
+        }
+
+        let meta_page = self.read_page(0)?;
+        let current_free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap());
+
+        let mut freed_page = Page::default();
+        freed_page.data[0..4].copy_from_slice(&current_free_head.to_le_bytes());
+        self.write_page(page_id, &freed_page)?;
+
+        let mut updated_meta = meta_page;
+        updated_meta.data[4..8].copy_from_slice(&page_id.to_le_bytes());
+        self.write_page(0, &updated_meta)?;
+
+        Ok(())
     }
 
     /// Syncs the underlying file to disk.
@@ -100,11 +142,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut pager = Pager::open(temp_file.path()).unwrap();
 
-        assert_eq!(pager.num_pages, 0);
+        // Page 0 initialized automatically
+        assert_eq!(pager.num_pages, 1);
 
         let page_id = pager.allocate_page().unwrap();
-        assert_eq!(page_id, 0);
-        assert_eq!(pager.num_pages, 1);
+        assert_eq!(page_id, 1);
+        assert_eq!(pager.num_pages, 2);
 
         let mut page = Page::default();
         page.data[0] = 42;
@@ -115,5 +158,23 @@ mod tests {
         let read_page = pager.read_page(page_id).unwrap();
         assert_eq!(read_page.data[0], 42);
         assert_eq!(read_page.data[4095], 99);
+    }
+
+    #[test]
+    fn test_pager_free_list_recycling() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut pager = Pager::open(temp_file.path()).unwrap();
+
+        let page1 = pager.allocate_page().unwrap();
+        let page2 = pager.allocate_page().unwrap();
+
+        pager.free_page(page1).unwrap();
+
+        let reused_page = pager.allocate_page().unwrap();
+        assert_eq!(reused_page, page1);
+
+        let new_page = pager.allocate_page().unwrap();
+        assert_ne!(new_page, page1);
+        assert_ne!(new_page, page2);
     }
 }
