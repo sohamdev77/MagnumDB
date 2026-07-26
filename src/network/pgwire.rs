@@ -30,7 +30,7 @@ impl PgWireHandler {
         let mut body = vec![0u8; msg_len - 4];
         socket.read_exact(&mut body).await?;
 
-        let code = i32::from_be_bytes(body[0..4].try_into().unwrap());
+        let code = i32::from_be_bytes(body[0..4].try_into().unwrap_or([0; 4]));
 
         if code == 80877103 {
             // SSL Request -> Respond 'N' (SSL not supported, fallback to plain TCP)
@@ -80,13 +80,15 @@ impl PgWireHandler {
                 let query_str = String::from_utf8_lossy(&qbody[..qbody.len() - 1]);
                 let sql = query_str.trim();
 
-                let exec_res = {
-                    let mut guard = self.db.lock().unwrap();
-                    let mut executor = Executor::new(&mut guard);
-                    match Parser::parse(sql) {
-                        Ok(stmt) => executor.execute(stmt),
-                        Err(e) => Err(e),
+                let exec_res = match self.db.lock() {
+                    Ok(mut guard) => {
+                        let mut executor = Executor::new(&mut guard);
+                        match Parser::parse(sql) {
+                            Ok(stmt) => executor.execute(stmt),
+                            Err(e) => Err(e),
+                        }
                     }
+                    Err(e) => Err(anyhow::anyhow!("Database lock error: {}", e)),
                 };
 
                 match exec_res {

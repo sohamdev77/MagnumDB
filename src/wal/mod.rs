@@ -69,10 +69,25 @@ impl WriteAheadLog {
                 break; // Corrupted / partial write at EOF
             }
 
-            let lsn = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-            let tx_id = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let lsn_bytes: [u8; 8] = match header_buf[0..8].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let lsn = u64::from_le_bytes(lsn_bytes);
+
+            let tx_id_bytes: [u8; 8] = match header_buf[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let tx_id = u64::from_le_bytes(tx_id_bytes);
+
             let op_code = header_buf[16];
-            let payload_len = u32::from_le_bytes(header_buf[17..21].try_into().unwrap()) as usize;
+
+            let len_bytes: [u8; 4] = match header_buf[17..21].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
             let mut payload = vec![0u8; payload_len];
             if self.file.read_exact(&mut payload).is_err() {
@@ -106,15 +121,21 @@ impl WriteAheadLog {
                     if payload.len() < 8 {
                         break;
                     }
-                    let klen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                    let klen_bytes: [u8; 4] = match payload[0..4].try_into() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    let klen = u32::from_le_bytes(klen_bytes) as usize;
                     if payload.len() < 4 + klen + 4 {
                         break;
                     }
                     let key = payload[4..4 + klen].to_vec();
                     let vlen_offset = 4 + klen;
-                    let vlen = u32::from_le_bytes(
-                        payload[vlen_offset..vlen_offset + 4].try_into().unwrap(),
-                    ) as usize;
+                    let vlen_bytes: [u8; 4] = match payload[vlen_offset..vlen_offset + 4].try_into() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    let vlen = u32::from_le_bytes(vlen_bytes) as usize;
                     if payload.len() < vlen_offset + 4 + vlen {
                         break;
                     }
@@ -132,7 +153,11 @@ impl WriteAheadLog {
                     if payload.len() < 4 {
                         break;
                     }
-                    let klen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                    let klen_bytes: [u8; 4] = match payload[0..4].try_into() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    let klen = u32::from_le_bytes(klen_bytes) as usize;
                     if payload.len() < 4 + klen {
                         break;
                     }

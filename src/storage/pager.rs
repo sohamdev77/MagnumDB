@@ -84,11 +84,11 @@ impl Pager {
     /// Appends a new blank page or reuses a freed page from the free list.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         let meta_page = self.read_page(0)?;
-        let free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap());
+        let free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap_or([0xFF; 4]));
 
         if free_head != u32::MAX && free_head < self.num_pages && free_head != 0 {
             let free_page = self.read_page(free_head)?;
-            let next_free = u32::from_le_bytes(free_page.data[0..4].try_into().unwrap());
+            let next_free = u32::from_le_bytes(free_page.data[0..4].try_into().unwrap_or([0xFF; 4]));
 
             let mut updated_meta = meta_page;
             updated_meta.data[4..8].copy_from_slice(&next_free.to_le_bytes());
@@ -113,7 +113,7 @@ impl Pager {
         }
 
         let meta_page = self.read_page(0)?;
-        let current_free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap());
+        let current_free_head = u32::from_le_bytes(meta_page.data[4..8].try_into().unwrap_or([0xFF; 4]));
 
         let mut freed_page = Page::default();
         freed_page.data[0..4].copy_from_slice(&current_free_head.to_le_bytes());

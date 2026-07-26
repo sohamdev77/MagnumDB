@@ -13,9 +13,10 @@ pub struct BufferPool {
 impl BufferPool {
     /// Creates a new BufferPool wrapping a Pager with a specific capacity limit.
     pub fn new(pager: Pager, capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
             pager,
-            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            cache: LruCache::new(cap),
         }
     }
 

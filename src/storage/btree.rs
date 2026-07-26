@@ -108,28 +108,28 @@ impl Node {
         let node_type = page.data[0];
         let mut offset = 1;
 
-        let num_elements = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap());
+        let num_elements = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap_or([0; 2]));
         offset += 2;
 
-        let p_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
+        let p_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0xFF; 4]));
         let parent_page_id = if p_id == u32::MAX { None } else { Some(p_id) };
         offset += 4;
 
         if node_type == NODE_TYPE_LEAF {
-            let n_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
+            let n_id = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0xFF; 4]));
             let next_leaf = if n_id == u32::MAX { None } else { Some(n_id) };
             offset += 4;
 
             let mut records = Vec::new();
             for _ in 0..num_elements {
                 let klen =
-                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
                 let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
 
                 let vlen =
-                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
                 let val = page.data[offset..offset + vlen].to_vec();
                 offset += vlen;
@@ -145,7 +145,7 @@ impl Node {
         } else {
             let mut children = Vec::new();
             for _ in 0..=num_elements {
-                let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
+                let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4]));
                 offset += 4;
                 children.push(child);
             }
@@ -153,7 +153,7 @@ impl Node {
             let mut keys = Vec::new();
             for _ in 0..num_elements {
                 let klen =
-                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
                 offset += 4;
                 let key = page.data[offset..offset + klen].to_vec();
                 offset += klen;
@@ -199,7 +199,7 @@ pub struct BTree {
 impl BTree {
     pub fn new(mut buffer_pool: BufferPool) -> anyhow::Result<Self> {
         let meta_page = buffer_pool.fetch_page(0)?;
-        let stored_root = u32::from_le_bytes(meta_page.data[0..4].try_into().unwrap());
+        let stored_root = u32::from_le_bytes(meta_page.data[0..4].try_into().unwrap_or([0; 4]));
 
         let root_page_id = if stored_root == 0 || stored_root == u32::MAX {
             // Page 1: Root leaf
@@ -289,15 +289,15 @@ impl BTree {
     /// Reassembles value from overflow pages if it contains an overflow handle.
     fn read_value_resolve_overflow(&mut self, val_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         if val_bytes.len() == 12 && &val_bytes[0..4] == OVERFLOW_MAGIC {
-            let total_len = u32::from_le_bytes(val_bytes[4..8].try_into().unwrap()) as usize;
-            let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap());
+            let total_len = u32::from_le_bytes(val_bytes[4..8].try_into().unwrap_or([0; 4])) as usize;
+            let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap_or([0; 4]));
 
             let mut result = Vec::with_capacity(total_len);
             let chunk_capacity = PAGE_SIZE - 4;
 
             while curr_page_id != u32::MAX {
                 let page = self.buffer_pool.fetch_page(curr_page_id)?;
-                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap());
+                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap_or([0xFF; 4]));
 
                 let remaining = total_len - result.len();
                 let take_len = remaining.min(chunk_capacity);
@@ -315,10 +315,10 @@ impl BTree {
     /// Frees overflow pages associated with a record handle.
     fn free_overflow_chain(&mut self, val_bytes: &[u8]) -> anyhow::Result<()> {
         if val_bytes.len() == 12 && &val_bytes[0..4] == OVERFLOW_MAGIC {
-            let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap());
+            let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap_or([0; 4]));
             while curr_page_id != u32::MAX {
                 let page = self.buffer_pool.fetch_page(curr_page_id)?;
-                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap());
+                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap_or([0xFF; 4]));
                 self.buffer_pool.free_page(curr_page_id)?;
                 curr_page_id = next_page_id;
             }

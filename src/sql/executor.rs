@@ -445,7 +445,7 @@ impl<'a> Executor<'a> {
                 let existing_bytes = if self.in_transaction
                     && self.write_buffer.contains_key(&internal_key)
                 {
-                    self.write_buffer.get(&internal_key).unwrap().clone()
+                    self.write_buffer.get(&internal_key).cloned().flatten()
                 } else {
                     self.db.get(&internal_key)?
                 };
@@ -532,7 +532,7 @@ impl<'a> Executor<'a> {
     fn get_schema_bytes(&mut self, table_name: &str) -> Result<Option<Vec<u8>>> {
         let schema_key = format!("__schema__:{}", table_name);
         if self.in_transaction && self.write_buffer.contains_key(schema_key.as_bytes()) {
-            Ok(self.write_buffer.get(schema_key.as_bytes()).unwrap().clone())
+            Ok(self.write_buffer.get(schema_key.as_bytes()).cloned().flatten())
         } else {
             self.db.get(schema_key.as_bytes())
         }

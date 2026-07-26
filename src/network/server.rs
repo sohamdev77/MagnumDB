@@ -45,14 +45,18 @@ impl Server {
                     let query = String::from_utf8_lossy(&query_buf);
 
                     let response = {
-                        let mut guard = db_ref.lock().unwrap();
-                        let mut executor = Executor::new(&mut guard);
-                        match Parser::parse(&query) {
-                            Ok(stmt) => match executor.execute(stmt) {
-                                Ok(res) => res,
-                                Err(e) => format!("Error: {}", e),
-                            },
-                            Err(e) => format!("Error: {}", e),
+                        match db_ref.lock() {
+                            Ok(mut guard) => {
+                                let mut executor = Executor::new(&mut guard);
+                                match Parser::parse(&query) {
+                                    Ok(stmt) => match executor.execute(stmt) {
+                                        Ok(res) => res,
+                                        Err(e) => format!("Error: {}", e),
+                                    },
+                                    Err(e) => format!("Error: {}", e),
+                                }
+                            }
+                            Err(e) => format!("Error: Internal database lock error: {}", e),
                         }
                     };
 
