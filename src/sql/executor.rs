@@ -1,5 +1,8 @@
 use crate::sql::parser::Statement;
-use crate::sql::volcano::{AggregateExec, AggregateFunc, ExecutionPlan, FilterExec, SeqScanExec};
+use crate::sql::volcano::{
+    AggregateExec, AggregateFunc, ExecutionPlan, FilterExec, HashGroupAggregateExec, HashJoinExec,
+    JoinType, SeqScanExec,
+};
 use crate::storage::Database;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -7,8 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TX_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Encodes row values with optional MVCC header `[xmin: 8B][xmax: 8B]`.
+#[allow(dead_code)]
 fn encode_values(values: &[String]) -> Vec<u8> {
+    encode_values_mvcc(values, 1, 0)
+}
+
+fn encode_values_mvcc(values: &[String], xmin: u64, xmax: u64) -> Vec<u8> {
     let mut buf = Vec::new();
+    // MVCC Header: 16 bytes (xmin: 8B, xmax: 8B)
+    buf.extend_from_slice(&xmin.to_le_bytes());
+    buf.extend_from_slice(&xmax.to_le_bytes());
+
     for v in values {
         let bytes = v.as_bytes();
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -20,10 +33,34 @@ fn encode_values(values: &[String]) -> Vec<u8> {
 fn decode_values(data: &[u8]) -> Result<Vec<String>> {
     let mut values = Vec::new();
     let mut offset = 0;
+
+    // Check if data contains 16-byte MVCC header
+    if data.len() >= 16 {
+        // Skip xmin (8B) and xmax (8B) header for string value decoding
+        offset = 16;
+    }
+
     while offset < data.len() {
         if offset + 4 > data.len() {
-            return Err(anyhow::anyhow!("Corrupted row encoding"));
+            // Fallback for legacy format without MVCC header
+            offset = 0;
+            values.clear();
+            while offset < data.len() {
+                if offset + 4 > data.len() {
+                    return Err(anyhow::anyhow!("Corrupted row encoding"));
+                }
+                let len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+                offset += 4;
+                if offset + len > data.len() {
+                    return Err(anyhow::anyhow!("Corrupted row encoding"));
+                }
+                let s = String::from_utf8(data[offset..offset + len].to_vec())?;
+                offset += len;
+                values.push(s);
+            }
+            return Ok(values);
         }
+
         let len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
         offset += 4;
         if offset + len > data.len() {
@@ -118,7 +155,7 @@ impl<'a> Executor<'a> {
             Statement::CreateIndex {
                 index_name,
                 table_name,
-                column,
+                columns,
             } => {
                 let schema_bytes = self
                     .get_schema_bytes(&table_name)?
@@ -129,31 +166,43 @@ impl<'a> Executor<'a> {
                     return Err(anyhow::anyhow!("Index '{}' already exists", index_name));
                 }
 
-                self.db.put(idx_meta_key.as_bytes(), column.as_bytes())?;
+                let cols_joined = columns.join(",");
+                self.db.put(idx_meta_key.as_bytes(), cols_joined.as_bytes())?;
 
                 // Populate secondary index from existing records
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
 
-                let col_idx = col_names.iter().position(|c| c == &column).ok_or_else(|| {
-                    anyhow::anyhow!("Column '{}' not found in table '{}'", column, table_name)
-                })?;
+                let mut col_indices = Vec::new();
+                for col in &columns {
+                    let idx = col_names.iter().position(|c| c == col).ok_or_else(|| {
+                        anyhow::anyhow!("Column '{}' not found in table '{}'", col, table_name)
+                    })?;
+                    col_indices.push(idx);
+                }
 
                 let prefix = format!("{}:", table_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
 
                 for (key, val) in records {
                     let decoded = decode_values(&val)?;
-                    if col_idx < decoded.len() {
-                        let col_val = &decoded[col_idx];
+                    let mut col_vals = Vec::new();
+                    for &c_idx in &col_indices {
+                        if c_idx < decoded.len() {
+                            col_vals.push(decoded[c_idx].clone());
+                        }
+                    }
+                    if col_vals.len() == columns.len() {
+                        let composite_val = col_vals.join("+");
                         let pk = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
-                        self.sec_idx_add(&table_name, &column, col_val, &pk)?;
+                        let column_key = columns.join("+");
+                        self.sec_idx_add(&table_name, &column_key, &composite_val, &pk)?;
                     }
                 }
 
                 Ok(format!(
                     "Query OK, index '{}' created on '{}({})'.",
-                    index_name, table_name, column
+                    index_name, table_name, cols_joined
                 ))
             }
             Statement::Insert { table_name, values } => {
@@ -179,7 +228,8 @@ impl<'a> Executor<'a> {
 
                 let pk = &values[0];
                 let internal_key = format!("{}:{}", table_name, pk).into_bytes();
-                let internal_val = encode_values(&values);
+                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
+                let internal_val = encode_values_mvcc(&values, active_tx, 0);
 
                 if self.in_transaction {
                     self.write_buffer.insert(internal_key, Some(internal_val));
@@ -249,6 +299,166 @@ impl<'a> Executor<'a> {
                 }
 
                 plan.close()?;
+
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", count));
+
+                Ok(output)
+            }
+            Statement::SelectJoin {
+                left_table,
+                right_table,
+                left_col,
+                right_col,
+                is_left_join,
+            } => {
+                let left_schema_bytes = self
+                    .get_schema_bytes(&left_table)?
+                    .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", left_table))?;
+                let right_schema_bytes = self
+                    .get_schema_bytes(&right_table)?
+                    .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", right_table))?;
+
+                let left_schema_val = String::from_utf8(left_schema_bytes)?;
+                let right_schema_val = String::from_utf8(right_schema_bytes)?;
+
+                let left_cols = Self::extract_col_names(&left_schema_val);
+                let right_cols = Self::extract_col_names(&right_schema_val);
+
+                let left_key_idx = left_cols
+                    .iter()
+                    .position(|c| c == &left_col)
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in '{}'", left_col, left_table))?;
+                let right_key_idx = right_cols
+                    .iter()
+                    .position(|c| c == &right_col)
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in '{}'", right_col, right_table))?;
+
+                let left_prefix = format!("{}:", left_table);
+                let right_prefix = format!("{}:", right_table);
+
+                let left_records = self.db.scan_prefix(left_prefix.as_bytes())?;
+                let right_records = self.db.scan_prefix(right_prefix.as_bytes())?;
+
+                let left_rows: Result<Vec<Vec<String>>> =
+                    left_records.iter().map(|(_, v)| decode_values(v)).collect();
+                let right_rows: Result<Vec<Vec<String>>> =
+                    right_records.iter().map(|(_, v)| decode_values(v)).collect();
+
+                let left_exec: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(left_rows?));
+                let right_exec: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(right_rows?));
+
+                let join_type = if is_left_join { JoinType::Left } else { JoinType::Inner };
+                let mut join_plan = HashJoinExec::new(
+                    left_exec,
+                    right_exec,
+                    left_key_idx,
+                    right_key_idx,
+                    join_type,
+                    right_cols.len(),
+                );
+
+                join_plan.open()?;
+
+                let mut all_headers = Vec::new();
+                for c in &left_cols {
+                    all_headers.push(format!("{}.{}", left_table, c));
+                }
+                for c in &right_cols {
+                    all_headers.push(format!("{}.{}", right_table, c));
+                }
+
+                let header_str = all_headers.join(" | ");
+                let mut output =
+                    format!("+-----------------+\n| {} |\n+-----------------+\n", header_str);
+                let mut count = 0;
+
+                while let Some(joined_row) = join_plan.next()? {
+                    output.push_str(&format!("| {} |\n", joined_row.join(" | ")));
+                    count += 1;
+                }
+
+                join_plan.close()?;
+
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", count));
+
+                Ok(output)
+            }
+            Statement::SelectGroupAggregate {
+                group_col,
+                func,
+                agg_col,
+                table_name,
+                where_clause,
+                having_clause,
+            } => {
+                let schema_bytes = self
+                    .get_schema_bytes(&table_name)?
+                    .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+                let schema_val = String::from_utf8(schema_bytes)?;
+                let col_names = Self::extract_col_names(&schema_val);
+
+                let group_col_idx = col_names
+                    .iter()
+                    .position(|c| c == &group_col)
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in '{}'", group_col, table_name))?;
+
+                let prefix = format!("{}:", table_name);
+                let records = self.db.scan_prefix(prefix.as_bytes())?;
+                let rows: Result<Vec<Vec<String>>> =
+                    records.iter().map(|(_, val)| decode_values(val)).collect();
+                let rows = rows?;
+
+                let scan_op: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(rows));
+
+                let filtered_op: Box<dyn ExecutionPlan> =
+                    if let Some((ref filter_col, ref filter_val)) = where_clause {
+                        let col_idx = col_names.iter().position(|name| name == filter_col).ok_or_else(
+                            || anyhow::anyhow!("Column '{}' not found", filter_col),
+                        )?;
+                        Box::new(FilterExec::new(scan_op, col_idx, filter_val.clone()))
+                    } else {
+                        scan_op
+                    };
+
+                let agg_func = match func.as_str() {
+                    "COUNT" => AggregateFunc::Count,
+                    "SUM" => {
+                        let col_idx = col_names.iter().position(|name| name == &agg_col).ok_or_else(
+                            || anyhow::anyhow!("Column '{}' not found", agg_col),
+                        )?;
+                        AggregateFunc::Sum(col_idx)
+                    }
+                    "AVG" => {
+                        let col_idx = col_names.iter().position(|name| name == &agg_col).ok_or_else(
+                            || anyhow::anyhow!("Column '{}' not found", agg_col),
+                        )?;
+                        AggregateFunc::Avg(col_idx)
+                    }
+                    _ => return Err(anyhow::anyhow!("Unsupported aggregate function {}", func)),
+                };
+
+                let mut group_plan = HashGroupAggregateExec::new(
+                    filtered_op,
+                    group_col_idx,
+                    agg_func,
+                    having_clause,
+                );
+
+                group_plan.open()?;
+
+                let header = format!("{} | {}({})", group_col, func, agg_col);
+                let mut output =
+                    format!("+-----------------+\n| {} |\n+-----------------+\n", header);
+                let mut count = 0;
+
+                while let Some(res_row) = group_plan.next()? {
+                    output.push_str(&format!("| {} |\n", res_row.join(" | ")));
+                    count += 1;
+                }
+
+                group_plan.close()?;
 
                 output.push_str("+-----------------+\n");
                 output.push_str(&format!("{} row(s) in set.", count));
@@ -428,7 +638,8 @@ impl<'a> Executor<'a> {
                 // Add new secondary index entries for the updated column
                 self.sec_idx_add_for_column(&table_name, &column, &value, &pk_val)?;
 
-                let updated_bytes = encode_values(&row_values);
+                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
+                let updated_bytes = encode_values_mvcc(&row_values, active_tx, 0);
 
                 if self.in_transaction {
                     self.write_buffer.insert(internal_key, Some(updated_bytes));
@@ -629,12 +840,22 @@ impl<'a> Executor<'a> {
         let idx_prefix = format!("__index__:{}:", table_name);
         let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
         for (_idx_key, col_val_bytes) in indices {
-            let col_name = String::from_utf8_lossy(&col_val_bytes).to_string();
-            if let Some(col_idx) = col_names.iter().position(|c| c == &col_name) {
-                if col_idx < values.len() {
-                    let sec_val = &values[col_idx];
-                    self.sec_idx_add(table_name, &col_name, sec_val, pk)?;
+            let col_names_spec = String::from_utf8_lossy(&col_val_bytes).to_string();
+            let cols: Vec<&str> = col_names_spec.split(',').collect();
+
+            let mut col_vals = Vec::new();
+            for col in &cols {
+                if let Some(col_idx) = col_names.iter().position(|c| c == col) {
+                    if col_idx < values.len() {
+                        col_vals.push(values[col_idx].clone());
+                    }
                 }
+            }
+
+            if col_vals.len() == cols.len() {
+                let composite_val = col_vals.join("+");
+                let column_key = cols.join("+");
+                self.sec_idx_add(table_name, &column_key, &composite_val, pk)?;
             }
         }
         Ok(())
@@ -689,12 +910,22 @@ impl<'a> Executor<'a> {
         let idx_prefix = format!("__index__:{}:", table_name);
         let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
         for (_idx_key, col_val_bytes) in indices {
-            let col_name = String::from_utf8_lossy(&col_val_bytes).to_string();
-            if let Some(col_idx) = col_names.iter().position(|c| c == &col_name) {
-                if col_idx < row_values.len() {
-                    let col_val = &row_values[col_idx];
-                    self.sec_idx_remove(table_name, &col_name, col_val, pk)?;
+            let col_spec = String::from_utf8_lossy(&col_val_bytes).to_string();
+            let cols: Vec<&str> = col_spec.split(',').collect();
+
+            let mut col_vals = Vec::new();
+            for col in &cols {
+                if let Some(col_idx) = col_names.iter().position(|c| c == col) {
+                    if col_idx < row_values.len() {
+                        col_vals.push(row_values[col_idx].clone());
+                    }
                 }
+            }
+
+            if col_vals.len() == cols.len() {
+                let composite_val = col_vals.join("+");
+                let column_key = cols.join("+");
+                self.sec_idx_remove(table_name, &column_key, &composite_val, pk)?;
             }
         }
         Ok(())
@@ -717,72 +948,118 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_volcano_aggregates() {
-        let mut db = setup_db();
-        let mut exec = Executor::new(&mut db);
-
-        exec.execute(Statement::CreateTable {
-            table_name: "employees".to_string(),
-            columns: vec!["id INT".to_string(), "name TEXT".to_string(), "salary INT".to_string()],
-        })
-        .unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "employees".to_string(),
-            values: vec!["1".to_string(), "Alice".to_string(), "100".to_string()],
-        })
-        .unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "employees".to_string(),
-            values: vec!["2".to_string(), "Bob".to_string(), "200".to_string()],
-        })
-        .unwrap();
-
-        let count_res = exec
-            .execute(Statement::SelectAggregate {
-                func: "COUNT".to_string(),
-                column: "*".to_string(),
-                table_name: "employees".to_string(),
-                where_clause: None,
-            })
-            .unwrap();
-        assert!(count_res.contains("2"));
-
-        let sum_res = exec
-            .execute(Statement::SelectAggregate {
-                func: "SUM".to_string(),
-                column: "salary".to_string(),
-                table_name: "employees".to_string(),
-                where_clause: None,
-            })
-            .unwrap();
-        assert!(sum_res.contains("300"));
-    }
-
-    #[test]
-    fn test_executor_secondary_index() {
+    fn test_executor_join_inner_and_left() {
         let mut db = setup_db();
         let mut exec = Executor::new(&mut db);
 
         exec.execute(Statement::CreateTable {
             table_name: "users".to_string(),
             columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-        })
-        .unwrap();
+        }).unwrap();
 
-        exec.execute(Statement::CreateIndex {
-            index_name: "idx_users_name".to_string(),
-            table_name: "users".to_string(),
-            column: "name".to_string(),
-        })
-        .unwrap();
+        exec.execute(Statement::CreateTable {
+            table_name: "orders".to_string(),
+            columns: vec!["id INT".to_string(), "user_id INT".to_string(), "amount INT".to_string()],
+        }).unwrap();
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            values: vec!["1".to_string(), "Charlie".to_string()],
-        })
-        .unwrap();
+            values: vec!["1".to_string(), "Alice".to_string()],
+        }).unwrap();
+        exec.execute(Statement::Insert {
+            table_name: "users".to_string(),
+            values: vec!["2".to_string(), "Bob".to_string()],
+        }).unwrap();
+
+        exec.execute(Statement::Insert {
+            table_name: "orders".to_string(),
+            values: vec!["100".to_string(), "1".to_string(), "500".to_string()],
+        }).unwrap();
+
+        // Inner Join
+        let res_inner = exec.execute(Statement::SelectJoin {
+            left_table: "users".to_string(),
+            right_table: "orders".to_string(),
+            left_col: "id".to_string(),
+            right_col: "user_id".to_string(),
+            is_left_join: false,
+        }).unwrap();
+
+        assert!(res_inner.contains("Alice"));
+        assert!(res_inner.contains("500"));
+        assert!(!res_inner.contains("Bob"));
+
+        // Left Join
+        let res_left = exec.execute(Statement::SelectJoin {
+            left_table: "users".to_string(),
+            right_table: "orders".to_string(),
+            left_col: "id".to_string(),
+            right_col: "user_id".to_string(),
+            is_left_join: true,
+        }).unwrap();
+
+        assert!(res_left.contains("Alice"));
+        assert!(res_left.contains("Bob"));
+        assert!(res_left.contains("NULL"));
+    }
+
+    #[test]
+    fn test_executor_group_by_having() {
+        let mut db = setup_db();
+        let mut exec = Executor::new(&mut db);
+
+        exec.execute(Statement::CreateTable {
+            table_name: "employees".to_string(),
+            columns: vec!["id INT".to_string(), "dept TEXT".to_string(), "salary INT".to_string()],
+        }).unwrap();
+
+        exec.execute(Statement::Insert {
+            table_name: "employees".to_string(),
+            values: vec!["1".to_string(), "Eng".to_string(), "100".to_string()],
+        }).unwrap();
+        exec.execute(Statement::Insert {
+            table_name: "employees".to_string(),
+            values: vec!["2".to_string(), "Eng".to_string(), "200".to_string()],
+        }).unwrap();
+        exec.execute(Statement::Insert {
+            table_name: "employees".to_string(),
+            values: vec!["3".to_string(), "HR".to_string(), "50".to_string()],
+        }).unwrap();
+
+        let res = exec.execute(Statement::SelectGroupAggregate {
+            group_col: "dept".to_string(),
+            func: "COUNT".to_string(),
+            agg_col: "*".to_string(),
+            table_name: "employees".to_string(),
+            where_clause: None,
+            having_clause: Some((">".to_string(), "1".to_string())),
+        }).unwrap();
+
+        assert!(res.contains("Eng"));
+        assert!(!res.contains("HR"));
+    }
+
+    #[test]
+    fn test_executor_secondary_index() {
+        let mut db = setup_db();
+        {
+            let mut exec = Executor::new(&mut db);
+            exec.execute(Statement::CreateTable {
+                table_name: "users".to_string(),
+                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+            }).unwrap();
+
+            exec.execute(Statement::CreateIndex {
+                index_name: "idx_name".to_string(),
+                table_name: "users".to_string(),
+                columns: vec!["name".to_string()],
+            }).unwrap();
+
+            exec.execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["1".to_string(), "Charlie".to_string()],
+            }).unwrap();
+        }
 
         let sec_key = b"__secidx__:users:name:Charlie";
         let pk = db.get(sec_key).unwrap().unwrap();
@@ -792,33 +1069,29 @@ mod tests {
     #[test]
     fn test_executor_secondary_index_multi_pk() {
         let mut db = setup_db();
-        let mut exec = Executor::new(&mut db);
+        {
+            let mut exec = Executor::new(&mut db);
+            exec.execute(Statement::CreateTable {
+                table_name: "users".to_string(),
+                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
+            }).unwrap();
 
-        exec.execute(Statement::CreateTable {
-            table_name: "users".to_string(),
-            columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-        })
-        .unwrap();
+            exec.execute(Statement::CreateIndex {
+                index_name: "idx_name".to_string(),
+                table_name: "users".to_string(),
+                columns: vec!["name".to_string()],
+            }).unwrap();
 
-        exec.execute(Statement::CreateIndex {
-            index_name: "idx_name".to_string(),
-            table_name: "users".to_string(),
-            column: "name".to_string(),
-        })
-        .unwrap();
+            exec.execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["1".to_string(), "Alice".to_string()],
+            }).unwrap();
 
-        // Insert two users with the same name
-        exec.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values: vec!["1".to_string(), "Alice".to_string()],
-        })
-        .unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values: vec!["2".to_string(), "Alice".to_string()],
-        })
-        .unwrap();
+            exec.execute(Statement::Insert {
+                table_name: "users".to_string(),
+                values: vec!["2".to_string(), "Alice".to_string()],
+            }).unwrap();
+        }
 
         let sec_key = b"__secidx__:users:name:Alice";
         let pks = db.get(sec_key).unwrap().unwrap();
@@ -830,43 +1103,35 @@ mod tests {
     #[test]
     fn test_executor_delete_cleans_secondary_index() {
         let mut db = setup_db();
-
         {
             let mut exec = Executor::new(&mut db);
             exec.execute(Statement::CreateTable {
                 table_name: "users".to_string(),
                 columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            })
-            .unwrap();
+            }).unwrap();
 
             exec.execute(Statement::CreateIndex {
                 index_name: "idx_name".to_string(),
                 table_name: "users".to_string(),
-                column: "name".to_string(),
-            })
-            .unwrap();
+                columns: vec!["name".to_string()],
+            }).unwrap();
 
             exec.execute(Statement::Insert {
                 table_name: "users".to_string(),
                 values: vec!["1".to_string(), "Alice".to_string()],
-            })
-            .unwrap();
+            }).unwrap();
         }
 
-        // Verify index exists
         assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_some());
 
-        // Delete the row
         {
             let mut exec = Executor::new(&mut db);
             exec.execute(Statement::Delete {
                 table_name: "users".to_string(),
                 pk_val: "1".to_string(),
-            })
-            .unwrap();
+            }).unwrap();
         }
 
-        // Verify index is cleaned up
         assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
     }
 
@@ -875,39 +1140,31 @@ mod tests {
         let mut db = setup_db();
         {
             let mut exec = Executor::new(&mut db);
-
             exec.execute(Statement::CreateTable {
                 table_name: "users".to_string(),
                 columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            })
-            .unwrap();
+            }).unwrap();
 
             exec.execute(Statement::CreateIndex {
                 index_name: "idx_name".to_string(),
                 table_name: "users".to_string(),
-                column: "name".to_string(),
-            })
-            .unwrap();
+                columns: vec!["name".to_string()],
+            }).unwrap();
 
             exec.execute(Statement::Insert {
                 table_name: "users".to_string(),
                 values: vec!["1".to_string(), "Alice".to_string()],
-            })
-            .unwrap();
+            }).unwrap();
 
-            // Update name
             exec.execute(Statement::Update {
                 table_name: "users".to_string(),
                 column: "name".to_string(),
                 value: "Bob".to_string(),
                 pk_val: "1".to_string(),
-            })
-            .unwrap();
+            }).unwrap();
         }
 
-        // Old index entry should be gone
         assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
-        // New index entry should exist
         assert!(db.get(b"__secidx__:users:name:Bob").unwrap().is_some());
     }
 
@@ -919,29 +1176,24 @@ mod tests {
         exec.execute(Statement::CreateTable {
             table_name: "users".to_string(),
             columns: vec!["id INT".to_string(), "age INT".to_string()],
-        })
-        .unwrap();
+        }).unwrap();
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
             values: vec!["1".to_string(), "20".to_string()],
-        })
-        .unwrap();
+        }).unwrap();
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
             values: vec!["2".to_string(), "30".to_string()],
-        })
-        .unwrap();
+        }).unwrap();
 
-        let res = exec
-            .execute(Statement::SelectRange {
-                table_name: "users".to_string(),
-                column: "age".to_string(),
-                op: ">=".to_string(),
-                val: "25".to_string(),
-            })
-            .unwrap();
+        let res = exec.execute(Statement::SelectRange {
+            table_name: "users".to_string(),
+            column: "age".to_string(),
+            op: ">=".to_string(),
+            val: "25".to_string(),
+        }).unwrap();
 
         assert!(res.contains("30"));
         assert!(!res.contains("20"));

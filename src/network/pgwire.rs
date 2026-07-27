@@ -1,16 +1,17 @@
 use crate::sql::{Executor, Parser};
 use crate::storage::Database;
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::RwLock;
 
 pub struct PgWireHandler {
-    db: Arc<Mutex<Database>>,
+    db: Arc<RwLock<Database>>,
 }
 
 impl PgWireHandler {
-    pub fn new(db: Arc<Mutex<Database>>) -> Self {
+    pub fn new(db: Arc<RwLock<Database>>) -> Self {
         Self { db }
     }
 
@@ -76,19 +77,17 @@ impl PgWireHandler {
             }
 
             if tag == b'Q' {
-                // Query
-                let query_str = String::from_utf8_lossy(&qbody[..qbody.len() - 1]);
+                // Simple Query Message
+                let query_str = String::from_utf8_lossy(&qbody[..qbody.len().saturating_sub(1)]);
                 let sql = query_str.trim();
 
-                let exec_res = match self.db.lock() {
-                    Ok(mut guard) => {
-                        let mut executor = Executor::new(&mut guard);
-                        match Parser::parse(sql) {
-                            Ok(stmt) => executor.execute(stmt),
-                            Err(e) => Err(e),
-                        }
+                let exec_res = {
+                    let mut guard = self.db.write().await;
+                    let mut executor = Executor::new(&mut guard);
+                    match Parser::parse(sql) {
+                        Ok(stmt) => executor.execute(stmt),
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(anyhow::anyhow!("Database lock error: {}", e)),
                 };
 
                 match exec_res {
@@ -102,7 +101,7 @@ impl PgWireHandler {
 
                 socket.write_all(&ready_msg).await?;
             } else if tag == b'X' {
-                // Terminate
+                // Terminate Message
                 break;
             }
         }
@@ -125,6 +124,56 @@ impl PgWireHandler {
     }
 
     async fn send_query_response(socket: &mut TcpStream, out: &str) -> Result<()> {
+        let lines: Vec<&str> = out.lines().collect();
+
+        // If the output looks like a formatted table, extract columns and rows for PGWire
+        if lines.len() >= 4 && lines[0].starts_with("+--") {
+            let header_line = lines[1].trim_matches('|').trim();
+            let col_names: Vec<&str> = header_line.split('|').map(|s| s.trim()).collect();
+
+            // Send RowDescription ('T')
+            let mut desc_body = Vec::new();
+            desc_body.extend_from_slice(&(col_names.len() as i16).to_be_bytes());
+
+            for col in &col_names {
+                desc_body.extend_from_slice(col.as_bytes());
+                desc_body.push(0); // null terminated string
+                desc_body.extend_from_slice(&0i32.to_be_bytes()); // table oid
+                desc_body.extend_from_slice(&0i16.to_be_bytes()); // col attr num
+                desc_body.extend_from_slice(&25i32.to_be_bytes()); // type oid (25 = TEXT)
+                desc_body.extend_from_slice(&(-1i16).to_be_bytes()); // type len
+                desc_body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+                desc_body.extend_from_slice(&0i16.to_be_bytes()); // format code (0 = text)
+            }
+
+            let mut desc_msg = vec![b'T'];
+            let desc_len = (desc_body.len() + 4) as i32;
+            desc_msg.extend_from_slice(&desc_len.to_be_bytes());
+            desc_msg.extend_from_slice(&desc_body);
+            socket.write_all(&desc_msg).await?;
+
+            // Send DataRow ('D') for each row
+            for line in &lines[3..lines.len() - 2] {
+                if line.starts_with('|') {
+                    let row_vals: Vec<&str> = line.trim_matches('|').split('|').map(|s| s.trim()).collect();
+                    let mut row_body = Vec::new();
+                    row_body.extend_from_slice(&(row_vals.len() as i16).to_be_bytes());
+
+                    for v in row_vals {
+                        let bytes = v.as_bytes();
+                        row_body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                        row_body.extend_from_slice(bytes);
+                    }
+
+                    let mut row_msg = vec![b'D'];
+                    let rlen = (row_body.len() + 4) as i32;
+                    row_msg.extend_from_slice(&rlen.to_be_bytes());
+                    row_msg.extend_from_slice(&row_body);
+                    socket.write_all(&row_msg).await?;
+                }
+            }
+        }
+
         // Send CommandComplete ('C')
         let tag = b"SELECT 1\0";
         let mut msg = vec![b'C'];
@@ -132,7 +181,7 @@ impl PgWireHandler {
         msg.extend_from_slice(&len.to_be_bytes());
         msg.extend_from_slice(tag);
         socket.write_all(&msg).await?;
-        let _ = out;
+
         Ok(())
     }
 

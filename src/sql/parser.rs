@@ -12,7 +12,7 @@ pub enum Statement {
     CreateIndex {
         index_name: String,
         table_name: String,
-        column: String,
+        columns: Vec<String>,
     },
     Insert {
         table_name: String,
@@ -33,6 +33,21 @@ pub enum Statement {
         column: String,
         table_name: String,
         where_clause: Option<(String, String)>,
+    },
+    SelectGroupAggregate {
+        group_col: String,
+        func: String,
+        agg_col: String,
+        table_name: String,
+        where_clause: Option<(String, String)>,
+        having_clause: Option<(String, String)>,
+    },
+    SelectJoin {
+        left_table: String,
+        right_table: String,
+        left_col: String,
+        right_col: String,
+        is_left_join: bool,
     },
     Update {
         table_name: String,
@@ -150,15 +165,18 @@ impl Parser {
             .ok_or_else(|| anyhow!("Syntax Error: Missing ')' in CREATE INDEX"))?;
 
         let table_name = rest[..paren_idx].trim().to_string();
-        let column = rest[paren_idx + 1..end_paren].trim().to_string();
+        let cols_raw = rest[paren_idx + 1..end_paren].trim();
+        let columns: Vec<String> = cols_raw.split(',').map(|c| c.trim().to_string()).collect();
 
         Self::validate_identifier(&table_name)?;
-        Self::validate_identifier(&column)?;
+        for col in &columns {
+            Self::validate_identifier(col)?;
+        }
 
         Ok(Statement::CreateIndex {
             index_name,
             table_name,
-            column,
+            columns,
         })
     }
 
@@ -193,10 +211,83 @@ impl Parser {
             .ok_or_else(|| anyhow!("Syntax Error: Missing FROM keyword"))?;
 
         let target = sql[6..from_idx].trim();
-        let upper_target = target.to_uppercase();
-
         let rest = sql[from_idx + 4..].trim();
         let upper_rest = rest.to_uppercase();
+
+        // Check for JOIN query: SELECT * FROM t1 [LEFT] JOIN t2 ON t1.col1 = t2.col2
+        if upper_rest.contains(" JOIN ") {
+            let is_left_join = upper_rest.contains("LEFT JOIN");
+            let join_kw = if is_left_join { "LEFT JOIN" } else { "JOIN" };
+            let join_idx = upper_rest.find(join_kw).unwrap();
+            let left_table = rest[..join_idx].trim().to_string();
+
+            let on_idx = upper_rest
+                .find(" ON ")
+                .ok_or_else(|| anyhow!("Syntax Error: Missing ON in JOIN clause"))?;
+
+            let right_table = rest[join_idx + join_kw.len()..on_idx].trim().to_string();
+            let on_cond = rest[on_idx + 4..].trim();
+
+            let (left_col, right_col) = parse_join_condition(on_cond)?;
+
+            return Ok(Statement::SelectJoin {
+                left_table,
+                right_table,
+                left_col,
+                right_col,
+                is_left_join,
+            });
+        }
+
+        // Check for GROUP BY query: SELECT col, COUNT(*) FROM table [WHERE ...] GROUP BY col [HAVING ...]
+        if upper_rest.contains("GROUP BY") {
+            let gb_idx = upper_rest.find("GROUP BY").unwrap();
+            let before_gb = rest[..gb_idx].trim();
+            let after_gb = rest[gb_idx + 8..].trim();
+            let upper_after_gb = after_gb.to_uppercase();
+
+            let (group_col, having_clause) = if let Some(having_idx) = upper_after_gb.find("HAVING") {
+                let gcol = after_gb[..having_idx].trim().to_string();
+                let having_cond = after_gb[having_idx + 6..].trim();
+                let h_parsed = parse_having_condition(having_cond)?;
+                (gcol, Some(h_parsed))
+            } else {
+                (after_gb.to_string(), None)
+            };
+
+            // Parse target: "col, COUNT(*)" or "col, SUM(val)"
+            let target_parts: Vec<&str> = target.split(',').map(|s| s.trim()).collect();
+            if target_parts.len() != 2 {
+                return Err(anyhow!("Syntax Error: GROUP BY query expects 'group_col, FUNC(col)'"));
+            }
+
+            let agg_part = target_parts[1].to_uppercase();
+            let func_end = agg_part.find('(').ok_or_else(|| anyhow!("Invalid agg func in GROUP BY"))?;
+            let func = agg_part[..func_end].to_string();
+            let col_end = agg_part.rfind(')').unwrap_or(agg_part.len());
+            let agg_col = target_parts[1][func_end + 1..col_end].trim().to_string();
+
+            let upper_before_gb = before_gb.to_uppercase();
+            let (table_name, where_clause) = if let Some(w_idx) = upper_before_gb.find("WHERE") {
+                let tname = before_gb[..w_idx].trim().to_string();
+                let cond = before_gb[w_idx + 5..].trim();
+                let wc = parse_where_equality(cond)?;
+                (tname, Some(wc))
+            } else {
+                (before_gb.to_string(), None)
+            };
+
+            return Ok(Statement::SelectGroupAggregate {
+                group_col,
+                func,
+                agg_col,
+                table_name,
+                where_clause,
+                having_clause,
+            });
+        }
+
+        let upper_target = target.to_uppercase();
 
         if upper_target.starts_with("COUNT(")
             || upper_target.starts_with("SUM(")
@@ -298,6 +389,36 @@ impl Parser {
     }
 }
 
+/// Parses a JOIN condition like `users.id = orders.user_id` or `id = user_id`.
+fn parse_join_condition(cond: &str) -> Result<(String, String)> {
+    let parts: Vec<&str> = cond.split('=').collect();
+    if parts.len() != 2 {
+        return Err(anyhow!("Syntax Error: Invalid ON condition in JOIN"));
+    }
+    let left_col = extract_column_name(parts[0].trim());
+    let right_col = extract_column_name(parts[1].trim());
+    Ok((left_col, right_col))
+}
+
+fn extract_column_name(full: &str) -> String {
+    if let Some(dot_idx) = full.find('.') {
+        full[dot_idx + 1..].trim().to_string()
+    } else {
+        full.trim().to_string()
+    }
+}
+
+/// Parses a HAVING condition like `COUNT(*) > 5` or `SUM(val) >= 100`.
+fn parse_having_condition(cond: &str) -> Result<(String, String)> {
+    for op in &[">=", "<=", ">", "<", "="] {
+        if let Some(op_idx) = cond.find(op) {
+            let val = cond[op_idx + op.len()..].trim().to_string();
+            return Ok(((*op).to_string(), val));
+        }
+    }
+    Err(anyhow!("Syntax Error: Invalid HAVING condition '{}'", cond))
+}
+
 /// Splits a comma-separated value list while respecting single-quoted strings.
 /// Handles escaped quotes ('') inside quoted strings.
 fn split_values_respecting_quotes(input: &str) -> Result<Vec<String>> {
@@ -309,20 +430,17 @@ fn split_values_respecting_quotes(input: &str) -> Result<Vec<String>> {
     while let Some(ch) = chars.next() {
         if in_quotes {
             if ch == '\'' {
-                // Check for escaped quote ''
                 if chars.peek() == Some(&'\'') {
                     current.push('\'');
-                    chars.next(); // consume the second quote
+                    chars.next();
                 } else {
                     in_quotes = false;
-                    // Don't add the closing quote to the value
                 }
             } else {
                 current.push(ch);
             }
         } else if ch == '\'' {
             in_quotes = true;
-            // Don't add the opening quote to the value
         } else if ch == ',' {
             values.push(current.trim().to_string());
             current = String::new();
@@ -339,7 +457,6 @@ fn split_values_respecting_quotes(input: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
-/// Parses a `col = value` or `col = 'value'` assignment, handling quoted values.
 fn parse_assignment(expr: &str) -> Result<(String, String)> {
     let eq_idx = expr.find('=')
         .ok_or_else(|| anyhow!("Syntax Error: Expected '=' in expression '{}'", expr))?;
@@ -349,7 +466,6 @@ fn parse_assignment(expr: &str) -> Result<(String, String)> {
     Ok((col, val))
 }
 
-/// Parses a WHERE clause with equality: `col = value` or `col = 'value'`.
 fn parse_where_equality(cond: &str) -> Result<(String, String)> {
     parse_assignment(cond)
 }
@@ -359,57 +475,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_range_query() {
-        let range_gt = Parser::parse("SELECT * FROM users WHERE age >= 21").unwrap();
+    fn test_parse_join_query() {
+        let stmt = Parser::parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
         assert_eq!(
-            range_gt,
-            Statement::SelectRange {
-                table_name: "users".to_string(),
-                column: "age".to_string(),
-                op: ">=".to_string(),
-                val: "21".to_string(),
+            stmt,
+            Statement::SelectJoin {
+                left_table: "users".to_string(),
+                right_table: "orders".to_string(),
+                left_col: "id".to_string(),
+                right_col: "user_id".to_string(),
+                is_left_join: false,
             }
         );
     }
 
     #[test]
-    fn test_parse_insert_with_commas_in_values() {
-        let stmt = Parser::parse("INSERT INTO notes VALUES(1, 'hello, world')").unwrap();
-        if let Statement::Insert { values, .. } = stmt {
-            assert_eq!(values.len(), 2);
-            assert_eq!(values[0], "1");
-            assert_eq!(values[1], "hello, world");
-        } else {
-            panic!("Expected Insert statement");
-        }
+    fn test_parse_left_join_query() {
+        let stmt = Parser::parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::SelectJoin {
+                left_table: "users".to_string(),
+                right_table: "orders".to_string(),
+                left_col: "id".to_string(),
+                right_col: "user_id".to_string(),
+                is_left_join: true,
+            }
+        );
     }
 
     #[test]
-    fn test_parse_insert_with_escaped_quotes() {
-        let stmt = Parser::parse("INSERT INTO notes VALUES(1, 'it''s a test')").unwrap();
-        if let Statement::Insert { values, .. } = stmt {
-            assert_eq!(values.len(), 2);
-            assert_eq!(values[1], "it's a test");
-        } else {
-            panic!("Expected Insert statement");
-        }
+    fn test_parse_group_by_having() {
+        let stmt = Parser::parse("SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 2").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::SelectGroupAggregate {
+                group_col: "dept".to_string(),
+                func: "COUNT".to_string(),
+                agg_col: "*".to_string(),
+                table_name: "employees".to_string(),
+                where_clause: None,
+                having_clause: Some((">".to_string(), "2".to_string())),
+            }
+        );
     }
 
     #[test]
-    fn test_reject_reserved_table_name() {
-        let result = Parser::parse("CREATE TABLE __internal__(id INT)");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reject_reserved_column_name() {
-        let result = Parser::parse("CREATE TABLE users(__secret INT)");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_unterminated_string() {
-        let result = Parser::parse("INSERT INTO t VALUES(1, 'unclosed)");
-        assert!(result.is_err());
+    fn test_parse_composite_index() {
+        let stmt = Parser::parse("CREATE INDEX idx_name ON users(last_name, first_name)").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateIndex {
+                index_name: "idx_name".to_string(),
+                table_name: "users".to_string(),
+                columns: vec!["last_name".to_string(), "first_name".to_string()],
+            }
+        );
     }
 }

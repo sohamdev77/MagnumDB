@@ -17,25 +17,31 @@ MagnumDB is an open-source embedded key-value and SQL database engine written 10
 - **Embedded Engine**: Runs directly inside Rust binaries with zero external C/C++ dependencies.
 - **WAL Durability**: Write-Ahead Logging (WAL) with TxID framing and CRC32 checksums ensures crash recovery.
 - **B+ Tree Indexing**: Custom 4KB page disk pager, LRU buffer pool management, overflow pages, and leaf page recycling.
-- **SQL Execution Engine**: Built-in SQL AST parser, Volcano-style streaming query execution, range filters, and secondary indexes.
+- **Relational SQL Query Engine**: Hash JOINs (`INNER JOIN`, `LEFT JOIN`), `GROUP BY` & `HAVING` analytical aggregations, range filters, and composite multi-column indexes.
+- **MVCC & Transactions**: MVCC row headers (`xmin`, `xmax`) and transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK`.
+- **PostgreSQL Protocol Compatibility**: Native PostgreSQL Wire Protocol (`pgwire`) handling `StartupMessage`, `RowDescription` (`T`), `DataRow` (`D`), and `CommandComplete` (`C`).
 - **Multi-Client TCP Server**: Async TCP server powered by Tokio with connection limits and idle timeouts.
-- **ACID Transactions**: Transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK` support.
 
 ---
 
-## What's New in v0.2.0
+## What's New in v0.3.0
 
-Version `0.2.0` represents a major production stability release resolving 14 core database engine issues:
+Version `0.3.0` is a milestone release introducing relational query capabilities and PostgreSQL protocol compatibility:
 
-- 🛡️ **Durable Transactions**: Transaction writes properly track `tx_id` in WAL records, and committed pages are flushed and synced on `COMMIT`.
-- 🔒 **Page Serialization Protection**: B+ Tree page serialization includes bounds-checking guards against 4KB overflows.
-- 📐 **Documented Metadata Page Layout**: Page 0 layout standardized with magic bytes (`MGDB`), root page ID, free-list head, and checkpoint LSN.
-- ⚡ **Optimized Crash Recovery**: Startup WAL recovery uses checkpoint LSN filtering to avoid full file replay.
-- 🧹 **Secondary Index Maintenance**: `DELETE` and `UPDATE` SQL queries automatically update and clean up secondary indexes.
-- 👥 **Multi-PK Secondary Indexes**: Secondary indexes now support multiple primary keys per indexed value (1:N mapping).
-- 💬 **Enhanced SQL Parsing**: Supports string literals with spaces, commas (`'hello, world'`), and escaped quotes (`''`).
-- 🛑 **Identifier Validation**: Reserved system namespace (`__`) protects catalog tables from SQL injection.
-- 🌐 **Async TCP Server Hardening**: Connection semaphore limits (`max_connections`) and idle read timeouts.
+- 🔗 **Relational JOINs**: Support for `INNER JOIN` and `LEFT JOIN` using streaming `HashJoinExec` Volcano operators:
+  ```sql
+  SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;
+  ```
+- 📊 **`GROUP BY` & `HAVING` Aggregations**: Streaming `HashGroupAggregateExec` operator for analytical groupings:
+  ```sql
+  SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 1;
+  ```
+- 📑 **Composite Multi-Column Indexes**: Supports secondary indexing over multiple columns:
+  ```sql
+  CREATE INDEX idx_name ON users(last_name, first_name);
+  ```
+- 🐘 **Native PostgreSQL Wire Protocol (`pgwire`)**: Server auto-detects and serves native PostgreSQL protocol connections (`StartupMessage`, `RowDescription`, `DataRow`, `CommandComplete`, `ReadyForQuery`).
+- ⏳ **MVCC Tuple Headers**: Binary row encoding incorporates `[xmin: 8B][xmax: 8B]` transaction visibility metadata.
 
 ---
 
@@ -43,7 +49,7 @@ Version `0.2.0` represents a major production stability release resolving 14 cor
 
 ```mermaid
 graph TD
-    A[Client / magnum shell] -->|SQL Query| B(SQL Parser)
+    A[Client / magnum shell / psql] -->|SQL Query| B(SQL Parser)
     B -->|AST| C(Query Executor)
     
     C -->|Reads/Writes| D[B+ Tree Index]
@@ -67,7 +73,7 @@ Add MagnumDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-magnumdb = "0.2.0"
+magnumdb = "0.3.0"
 ```
 
 ---

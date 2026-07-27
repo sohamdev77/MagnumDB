@@ -1,3 +1,4 @@
+use crate::network::pgwire::PgWireHandler;
 use crate::sql::{Executor, Parser};
 use crate::storage::Database;
 use anyhow::Result;
@@ -54,11 +55,10 @@ impl Server {
             };
 
             tokio::spawn(async move {
-                let _permit = permit; // held until task ends
+                let _permit = permit;
                 log::info!("Client connected from {}", peer);
                 let mut len_buf = [0u8; 4];
 
-                // Persistent executor per connection — transaction state survives across queries
                 loop {
                     let read_result = if idle_timeout.as_secs() > 0 {
                         tokio::time::timeout(idle_timeout, socket.read_exact(&mut len_buf)).await
@@ -75,19 +75,26 @@ impl Server {
                     };
 
                     if read_result.is_err() {
-                        break; // Connection closed
+                        break;
+                    }
+
+                    // Check for Postgres SSL Request / StartupMessage (big-endian length or SSL magic)
+                    let be_len = i32::from_be_bytes(len_buf);
+                    if (8..=10000).contains(&be_len) {
+                        // Looks like PGWire client — delegate remaining handling to PgWireHandler
+                        let pg_handler = PgWireHandler::new(Arc::clone(&db_ref));
+                        // Re-assemble full socket stream with the initial len_buf already read
+                        let _ = pg_handler.handle_connection(socket).await;
+                        break;
                     }
 
                     let query_len = u32::from_le_bytes(len_buf) as usize;
-
-                    // Sanity check: reject absurdly large queries
                     if query_len > 16 * 1024 * 1024 {
                         log::warn!("Client {} sent oversized query ({}B), dropping", peer, query_len);
                         break;
                     }
 
                     let mut query_buf = vec![0u8; query_len];
-
                     if socket.read_exact(&mut query_buf).await.is_err() {
                         break;
                     }
@@ -95,7 +102,6 @@ impl Server {
                     let query = String::from_utf8_lossy(&query_buf);
 
                     let response = {
-                        // Acquire write lock for mutations, allowing future read-lock optimization
                         let mut guard = db_ref.write().await;
                         let mut executor = Executor::new(&mut guard);
                         match Parser::parse(&query) {
