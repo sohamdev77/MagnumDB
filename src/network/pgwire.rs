@@ -1,6 +1,7 @@
 use crate::sql::{Executor, Parser};
 use crate::storage::Database;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -58,7 +59,10 @@ impl PgWireHandler {
         let ready_msg = vec![b'Z', 0, 0, 0, 5, b'I'];
         socket.write_all(&ready_msg).await?;
 
-        // Main Query Loop
+        let mut prepared_statements: HashMap<String, String> = HashMap::new();
+        let mut bound_sql = String::new();
+
+        // Main Message Loop
         loop {
             let mut tag_buf = [0u8; 1];
             if socket.read_exact(&mut tag_buf).await.is_err() {
@@ -76,33 +80,76 @@ impl PgWireHandler {
                 break;
             }
 
-            if tag == b'Q' {
-                // Simple Query Message
-                let query_str = String::from_utf8_lossy(&qbody[..qbody.len().saturating_sub(1)]);
-                let sql = query_str.trim();
+            match tag {
+                b'Q' => {
+                    // Simple Query ('Q')
+                    let query_str = String::from_utf8_lossy(&qbody[..qbody.len().saturating_sub(1)]);
+                    let sql = query_str.trim();
 
-                let exec_res = {
-                    let mut guard = self.db.write().await;
-                    let mut executor = Executor::new(&mut guard);
-                    match Parser::parse(sql) {
-                        Ok(stmt) => executor.execute(stmt),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                match exec_res {
-                    Ok(out) => {
-                        Self::send_query_response(&mut socket, &out).await?;
-                    }
-                    Err(e) => {
-                        Self::send_error_response(&mut socket, &e.to_string()).await?;
-                    }
+                    self.execute_and_respond(&mut socket, sql).await?;
+                    socket.write_all(&ready_msg).await?;
                 }
+                b'P' => {
+                    // Parse ('P'): Prepared Statement Registration
+                    if let Ok((stmt_name, sql_template)) = parse_p_message(&qbody) {
+                        prepared_statements.insert(stmt_name, sql_template);
+                    }
+                    // Response ParseComplete ('1')
+                    socket.write_all(&[b'1', 0, 0, 0, 4]).await?;
+                }
+                b'B' => {
+                    // Bind ('B'): Parameter Value Binding
+                    if let Ok((stmt_name, params)) = parse_b_message(&qbody) {
+                        if let Some(template) = prepared_statements.get(&stmt_name) {
+                            bound_sql = substitute_params(template, &params);
+                        } else if let Some(template) = prepared_statements.get("") {
+                            bound_sql = substitute_params(template, &params);
+                        }
+                    }
+                    // Response BindComplete ('2')
+                    socket.write_all(&[b'2', 0, 0, 0, 4]).await?;
+                }
+                b'E' => {
+                    // Execute ('E'): Execute bound statement
+                    if !bound_sql.is_empty() {
+                        let sql = bound_sql.clone();
+                        self.execute_and_respond(&mut socket, &sql).await?;
+                    } else {
+                        Self::send_query_response(&mut socket, "Query OK.").await?;
+                    }
+                    socket.write_all(&ready_msg).await?;
+                }
+                b'S' => {
+                    // Sync ('S')
+                    socket.write_all(&ready_msg).await?;
+                }
+                b'X' => {
+                    // Terminate ('X')
+                    break;
+                }
+                _ => {}
+            }
+        }
 
-                socket.write_all(&ready_msg).await?;
-            } else if tag == b'X' {
-                // Terminate Message
-                break;
+        Ok(())
+    }
+
+    async fn execute_and_respond(&self, socket: &mut TcpStream, sql: &str) -> Result<()> {
+        let exec_res = {
+            let mut guard = self.db.write().await;
+            let mut executor = Executor::new(&mut guard);
+            match Parser::parse(sql) {
+                Ok(stmt) => executor.execute(stmt),
+                Err(e) => Err(e),
+            }
+        };
+
+        match exec_res {
+            Ok(out) => {
+                Self::send_query_response(socket, &out).await?;
+            }
+            Err(e) => {
+                Self::send_error_response(socket, &e.to_string()).await?;
             }
         }
 
@@ -126,7 +173,6 @@ impl PgWireHandler {
     async fn send_query_response(socket: &mut TcpStream, out: &str) -> Result<()> {
         let lines: Vec<&str> = out.lines().collect();
 
-        // If the output looks like a formatted table, extract columns and rows for PGWire
         if lines.len() >= 4 && lines[0].starts_with("+--") {
             let header_line = lines[1].trim_matches('|').trim();
             let col_names: Vec<&str> = header_line.split('|').map(|s| s.trim()).collect();
@@ -137,13 +183,13 @@ impl PgWireHandler {
 
             for col in &col_names {
                 desc_body.extend_from_slice(col.as_bytes());
-                desc_body.push(0); // null terminated string
-                desc_body.extend_from_slice(&0i32.to_be_bytes()); // table oid
-                desc_body.extend_from_slice(&0i16.to_be_bytes()); // col attr num
-                desc_body.extend_from_slice(&25i32.to_be_bytes()); // type oid (25 = TEXT)
-                desc_body.extend_from_slice(&(-1i16).to_be_bytes()); // type len
-                desc_body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-                desc_body.extend_from_slice(&0i16.to_be_bytes()); // format code (0 = text)
+                desc_body.push(0);
+                desc_body.extend_from_slice(&0i32.to_be_bytes());
+                desc_body.extend_from_slice(&0i16.to_be_bytes());
+                desc_body.extend_from_slice(&25i32.to_be_bytes());
+                desc_body.extend_from_slice(&(-1i16).to_be_bytes());
+                desc_body.extend_from_slice(&(-1i32).to_be_bytes());
+                desc_body.extend_from_slice(&0i16.to_be_bytes());
             }
 
             let mut desc_msg = vec![b'T'];
@@ -197,5 +243,84 @@ impl PgWireHandler {
         msg.extend_from_slice(&body);
         socket.write_all(&msg).await?;
         Ok(())
+    }
+}
+
+/// Substitutes `$1`, `$2`, ... placeholders in a SQL template with bound values.
+pub fn substitute_params(sql: &str, params: &[String]) -> String {
+    let mut result = sql.to_string();
+    for (i, param) in params.iter().enumerate() {
+        let placeholder = format!("${}", i + 1);
+        result = result.replace(&placeholder, param);
+    }
+    result
+}
+
+fn parse_p_message(body: &[u8]) -> Result<(String, String)> {
+    let mut parts = body.split(|&b| b == 0);
+    let stmt_name = String::from_utf8_lossy(parts.next().unwrap_or(&[])).to_string();
+    let sql_template = String::from_utf8_lossy(parts.next().unwrap_or(&[])).to_string();
+    Ok((stmt_name, sql_template))
+}
+
+fn parse_b_message(body: &[u8]) -> Result<(String, Vec<String>)> {
+    let mut offset = 0;
+
+    // Portal name (null terminated)
+    while offset < body.len() && body[offset] != 0 {
+        offset += 1;
+    }
+    offset += 1; // skip null
+
+    // Statement name (null terminated)
+    let stmt_start = offset;
+    while offset < body.len() && body[offset] != 0 {
+        offset += 1;
+    }
+    let stmt_name = String::from_utf8_lossy(&body[stmt_start..offset]).to_string();
+    offset += 1; // skip null
+
+    let mut params = Vec::new();
+    if offset + 2 <= body.len() {
+        let num_formats = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset += 2 + num_formats * 2;
+
+        if offset + 2 <= body.len() {
+            let num_params = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+            offset += 2;
+
+            for _ in 0..num_params {
+                if offset + 4 <= body.len() {
+                    let param_len = i32::from_be_bytes([
+                        body[offset],
+                        body[offset + 1],
+                        body[offset + 2],
+                        body[offset + 3],
+                    ]);
+                    offset += 4;
+
+                    if param_len > 0 && offset + (param_len as usize) <= body.len() {
+                        let p_val = String::from_utf8_lossy(&body[offset..offset + (param_len as usize)]).to_string();
+                        params.push(p_val);
+                        offset += param_len as usize;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((stmt_name, params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_substitute_params() {
+        let sql = "SELECT * FROM users WHERE id = $1 AND name = $2";
+        let params = vec!["1".to_string(), "'Alice'".to_string()];
+        let substituted = substitute_params(sql, &params);
+        assert_eq!(substituted, "SELECT * FROM users WHERE id = 1 AND name = 'Alice'");
     }
 }

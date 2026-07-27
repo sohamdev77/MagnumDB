@@ -17,31 +17,26 @@ MagnumDB is an open-source embedded key-value and SQL database engine written 10
 - **Embedded Engine**: Runs directly inside Rust binaries with zero external C/C++ dependencies.
 - **WAL Durability**: Write-Ahead Logging (WAL) with TxID framing and CRC32 checksums ensures crash recovery.
 - **B+ Tree Indexing**: Custom 4KB page disk pager, LRU buffer pool management, overflow pages, and leaf page recycling.
-- **Relational SQL Query Engine**: Hash JOINs (`INNER JOIN`, `LEFT JOIN`), `GROUP BY` & `HAVING` analytical aggregations, range filters, and composite multi-column indexes.
+- **Relational SQL Query Engine**: Hash JOINs (`INNER JOIN`, `LEFT JOIN`), `GROUP BY` & `HAVING` aggregations, `ORDER BY` sorting, `LIMIT` & `OFFSET` pagination, and composite indexes.
 - **MVCC & Transactions**: MVCC row headers (`xmin`, `xmax`) and transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK`.
-- **PostgreSQL Protocol Compatibility**: Native PostgreSQL Wire Protocol (`pgwire`) handling `StartupMessage`, `RowDescription` (`T`), `DataRow` (`D`), and `CommandComplete` (`C`).
+- **PostgreSQL Protocol & Extended Querying**: Native PostgreSQL Wire Protocol (`pgwire`) supporting prepared statements and `$1`, `$2` parameter binding (`Parse`, `Bind`, `Execute`).
 - **Multi-Client TCP Server**: Async TCP server powered by Tokio with connection limits and idle timeouts.
 
 ---
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-Version `0.3.0` is a milestone release introducing relational query capabilities and PostgreSQL protocol compatibility:
+Version `0.4.0` expands SQL ordering, pagination, and ORM parameter binding:
 
-- 🔗 **Relational JOINs**: Support for `INNER JOIN` and `LEFT JOIN` using streaming `HashJoinExec` Volcano operators:
+- ↕️ **`ORDER BY` Sorting (`SortExec`)**: Sort query results by numeric or text columns in ascending or descending order:
   ```sql
-  SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;
+  SELECT * FROM users ORDER BY age DESC;
   ```
-- 📊 **`GROUP BY` & `HAVING` Aggregations**: Streaming `HashGroupAggregateExec` operator for analytical groupings:
+- 📄 **`LIMIT` & `OFFSET` Pagination (`LimitOffsetExec`)**: Skip offset rows and cap max result rows:
   ```sql
-  SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 1;
+  SELECT * FROM users ORDER BY age DESC LIMIT 10 OFFSET 5;
   ```
-- 📑 **Composite Multi-Column Indexes**: Supports secondary indexing over multiple columns:
-  ```sql
-  CREATE INDEX idx_name ON users(last_name, first_name);
-  ```
-- 🐘 **Native PostgreSQL Wire Protocol (`pgwire`)**: Server auto-detects and serves native PostgreSQL protocol connections (`StartupMessage`, `RowDescription`, `DataRow`, `CommandComplete`, `ReadyForQuery`).
-- ⏳ **MVCC Tuple Headers**: Binary row encoding incorporates `[xmin: 8B][xmax: 8B]` transaction visibility metadata.
+- 📝 **Extended PostgreSQL Protocol ($1 Parameter Binding)**: Server handles prepared statements (`Parse` 'P', `Bind` 'B', `Execute` 'E') with `$1, $2` parameter substitution for ORMs.
 
 ---
 
@@ -73,7 +68,7 @@ Add MagnumDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-magnumdb = "0.3.0"
+magnumdb = "0.4.0"
 ```
 
 ---
@@ -116,7 +111,7 @@ fn main() -> anyhow::Result<()> {
     exec.execute(Parser::parse("CREATE TABLE users(id INT, name TEXT)")?)?;
     exec.execute(Parser::parse("INSERT INTO users VALUES(1, 'Alice')")?)?;
     
-    let res = exec.execute(Parser::parse("SELECT * FROM users")?)?;
+    let res = exec.execute(Parser::parse("SELECT * FROM users ORDER BY id DESC LIMIT 5")?)?;
     println!("{}", res);
 
     Ok(())

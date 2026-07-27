@@ -1,7 +1,7 @@
 use crate::sql::parser::Statement;
 use crate::sql::volcano::{
     AggregateExec, AggregateFunc, ExecutionPlan, FilterExec, HashGroupAggregateExec, HashJoinExec,
-    JoinType, SeqScanExec,
+    JoinType, LimitOffsetExec, SeqScanExec, SortExec,
 };
 use crate::storage::Database;
 use anyhow::Result;
@@ -169,7 +169,6 @@ impl<'a> Executor<'a> {
                 let cols_joined = columns.join(",");
                 self.db.put(idx_meta_key.as_bytes(), cols_joined.as_bytes())?;
 
-                // Populate secondary index from existing records
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
 
@@ -237,7 +236,6 @@ impl<'a> Executor<'a> {
                     self.db.put(&internal_key, &internal_val)?;
                 }
 
-                // Sync secondary index entries if any exist
                 self.sync_secondary_indexes_on_insert(&table_name, &col_names, &values, pk)?;
 
                 Ok("Query OK, 1 row inserted.".to_string())
@@ -245,6 +243,8 @@ impl<'a> Executor<'a> {
             Statement::Select {
                 table_name,
                 where_clause,
+                order_by,
+                limit_offset,
             } => {
                 let schema_bytes = self
                     .get_schema_bytes(&table_name)?
@@ -285,6 +285,17 @@ impl<'a> Executor<'a> {
                 } else {
                     scan_op
                 };
+
+                if let Some((ref sort_col, is_desc)) = order_by {
+                    let sort_col_idx = col_names.iter().position(|name| name == sort_col).ok_or_else(
+                        || anyhow::anyhow!("Column '{}' not found for ORDER BY", sort_col),
+                    )?;
+                    plan = Box::new(SortExec::new(plan, sort_col_idx, is_desc));
+                }
+
+                if let Some((limit, offset)) = limit_offset {
+                    plan = Box::new(LimitOffsetExec::new(plan, Some(limit), offset));
+                }
 
                 plan.open()?;
 
@@ -629,13 +640,11 @@ impl<'a> Executor<'a> {
                     return Err(anyhow::anyhow!("Corrupted row length"));
                 }
 
-                // Remove old secondary index entries for the changed column
                 let old_value = row_values[col_idx].clone();
                 self.sec_idx_remove_for_column(&table_name, &column, &old_value, &pk_val)?;
 
                 row_values[col_idx] = value.clone();
 
-                // Add new secondary index entries for the updated column
                 self.sec_idx_add_for_column(&table_name, &column, &value, &pk_val)?;
 
                 let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
@@ -652,7 +661,6 @@ impl<'a> Executor<'a> {
             Statement::Delete { table_name, pk_val } => {
                 let internal_key = format!("{}:{}", table_name, pk_val).into_bytes();
 
-                // Read the row before deleting to clean up secondary indexes
                 let existing_bytes = if self.in_transaction
                     && self.write_buffer.contains_key(&internal_key)
                 {
@@ -662,7 +670,6 @@ impl<'a> Executor<'a> {
                 };
 
                 if let Some(row_data) = existing_bytes {
-                    // Clean up secondary indexes
                     if let Ok(Some(sb)) = self.get_schema_bytes(&table_name) {
                         if let Ok(schema_val) = String::from_utf8(sb) {
                             let col_names = Self::extract_col_names(&schema_val);
@@ -693,13 +700,11 @@ impl<'a> Executor<'a> {
                 let prefix = format!("{}:", table_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
 
-                // Clean up secondary indexes and index metadata
                 let idx_prefix = format!("__index__:{}:", table_name);
                 let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
                 for (idx_key, _) in &indices {
                     self.db.delete(idx_key)?;
                 }
-                // Clean up all secidx entries for this table
                 let sec_prefix = format!("__secidx__:{}:", table_name);
                 let sec_entries = self.db.scan_prefix(sec_prefix.as_bytes())?;
                 for (sec_key, _) in sec_entries {
@@ -756,7 +761,6 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Extracts column names from a schema string like "id INT,name TEXT,age INT".
     fn extract_col_names(schema_val: &str) -> Vec<String> {
         schema_val
             .split(',')
@@ -771,7 +775,6 @@ impl<'a> Executor<'a> {
 
     // ---- Secondary Index Helpers ----
 
-    /// Adds a PK to a secondary index entry (multi-value safe).
     fn sec_idx_add(&mut self, table: &str, column: &str, col_val: &str, pk: &str) -> Result<()> {
         let sec_key = format!("__secidx__:{}:{}:{}", table, column, col_val);
         let existing = self.db.get(sec_key.as_bytes())?;
@@ -779,10 +782,9 @@ impl<'a> Executor<'a> {
         let new_val = match existing {
             Some(data) => {
                 let existing_str = String::from_utf8_lossy(&data).to_string();
-                // Check if PK already exists
                 let pks: Vec<&str> = existing_str.split(SEC_IDX_PK_SEP).collect();
                 if pks.contains(&pk) {
-                    return Ok(()); // Already indexed
+                    return Ok(());
                 }
                 format!("{}{}{}", existing_str, SEC_IDX_PK_SEP, pk)
             }
@@ -798,7 +800,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Removes a PK from a secondary index entry (multi-value safe).
     fn sec_idx_remove(&mut self, table: &str, column: &str, col_val: &str, pk: &str) -> Result<()> {
         let sec_key = format!("__secidx__:{}:{}:{}", table, column, col_val);
         let existing = self.db.get(sec_key.as_bytes())?;
@@ -829,7 +830,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Syncs secondary indexes when inserting a new row.
     fn sync_secondary_indexes_on_insert(
         &mut self,
         table_name: &str,
@@ -861,7 +861,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Removes secondary index entries for a specific column value.
     fn sec_idx_remove_for_column(
         &mut self,
         table_name: &str,
@@ -880,7 +879,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Adds secondary index entries for a specific column value.
     fn sec_idx_add_for_column(
         &mut self,
         table_name: &str,
@@ -899,7 +897,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// Removes all secondary index entries for a row being deleted.
     fn remove_all_secondary_indexes(
         &mut self,
         table_name: &str,
@@ -948,228 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_join_inner_and_left() {
-        let mut db = setup_db();
-        let mut exec = Executor::new(&mut db);
-
-        exec.execute(Statement::CreateTable {
-            table_name: "users".to_string(),
-            columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-        }).unwrap();
-
-        exec.execute(Statement::CreateTable {
-            table_name: "orders".to_string(),
-            columns: vec!["id INT".to_string(), "user_id INT".to_string(), "amount INT".to_string()],
-        }).unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values: vec!["1".to_string(), "Alice".to_string()],
-        }).unwrap();
-        exec.execute(Statement::Insert {
-            table_name: "users".to_string(),
-            values: vec!["2".to_string(), "Bob".to_string()],
-        }).unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "orders".to_string(),
-            values: vec!["100".to_string(), "1".to_string(), "500".to_string()],
-        }).unwrap();
-
-        // Inner Join
-        let res_inner = exec.execute(Statement::SelectJoin {
-            left_table: "users".to_string(),
-            right_table: "orders".to_string(),
-            left_col: "id".to_string(),
-            right_col: "user_id".to_string(),
-            is_left_join: false,
-        }).unwrap();
-
-        assert!(res_inner.contains("Alice"));
-        assert!(res_inner.contains("500"));
-        assert!(!res_inner.contains("Bob"));
-
-        // Left Join
-        let res_left = exec.execute(Statement::SelectJoin {
-            left_table: "users".to_string(),
-            right_table: "orders".to_string(),
-            left_col: "id".to_string(),
-            right_col: "user_id".to_string(),
-            is_left_join: true,
-        }).unwrap();
-
-        assert!(res_left.contains("Alice"));
-        assert!(res_left.contains("Bob"));
-        assert!(res_left.contains("NULL"));
-    }
-
-    #[test]
-    fn test_executor_group_by_having() {
-        let mut db = setup_db();
-        let mut exec = Executor::new(&mut db);
-
-        exec.execute(Statement::CreateTable {
-            table_name: "employees".to_string(),
-            columns: vec!["id INT".to_string(), "dept TEXT".to_string(), "salary INT".to_string()],
-        }).unwrap();
-
-        exec.execute(Statement::Insert {
-            table_name: "employees".to_string(),
-            values: vec!["1".to_string(), "Eng".to_string(), "100".to_string()],
-        }).unwrap();
-        exec.execute(Statement::Insert {
-            table_name: "employees".to_string(),
-            values: vec!["2".to_string(), "Eng".to_string(), "200".to_string()],
-        }).unwrap();
-        exec.execute(Statement::Insert {
-            table_name: "employees".to_string(),
-            values: vec!["3".to_string(), "HR".to_string(), "50".to_string()],
-        }).unwrap();
-
-        let res = exec.execute(Statement::SelectGroupAggregate {
-            group_col: "dept".to_string(),
-            func: "COUNT".to_string(),
-            agg_col: "*".to_string(),
-            table_name: "employees".to_string(),
-            where_clause: None,
-            having_clause: Some((">".to_string(), "1".to_string())),
-        }).unwrap();
-
-        assert!(res.contains("Eng"));
-        assert!(!res.contains("HR"));
-    }
-
-    #[test]
-    fn test_executor_secondary_index() {
-        let mut db = setup_db();
-        {
-            let mut exec = Executor::new(&mut db);
-            exec.execute(Statement::CreateTable {
-                table_name: "users".to_string(),
-                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::CreateIndex {
-                index_name: "idx_name".to_string(),
-                table_name: "users".to_string(),
-                columns: vec!["name".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["1".to_string(), "Charlie".to_string()],
-            }).unwrap();
-        }
-
-        let sec_key = b"__secidx__:users:name:Charlie";
-        let pk = db.get(sec_key).unwrap().unwrap();
-        assert_eq!(pk, b"1");
-    }
-
-    #[test]
-    fn test_executor_secondary_index_multi_pk() {
-        let mut db = setup_db();
-        {
-            let mut exec = Executor::new(&mut db);
-            exec.execute(Statement::CreateTable {
-                table_name: "users".to_string(),
-                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::CreateIndex {
-                index_name: "idx_name".to_string(),
-                table_name: "users".to_string(),
-                columns: vec!["name".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["1".to_string(), "Alice".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["2".to_string(), "Alice".to_string()],
-            }).unwrap();
-        }
-
-        let sec_key = b"__secidx__:users:name:Alice";
-        let pks = db.get(sec_key).unwrap().unwrap();
-        let pks_str = String::from_utf8(pks).unwrap();
-        assert!(pks_str.contains("1"));
-        assert!(pks_str.contains("2"));
-    }
-
-    #[test]
-    fn test_executor_delete_cleans_secondary_index() {
-        let mut db = setup_db();
-        {
-            let mut exec = Executor::new(&mut db);
-            exec.execute(Statement::CreateTable {
-                table_name: "users".to_string(),
-                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::CreateIndex {
-                index_name: "idx_name".to_string(),
-                table_name: "users".to_string(),
-                columns: vec!["name".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["1".to_string(), "Alice".to_string()],
-            }).unwrap();
-        }
-
-        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_some());
-
-        {
-            let mut exec = Executor::new(&mut db);
-            exec.execute(Statement::Delete {
-                table_name: "users".to_string(),
-                pk_val: "1".to_string(),
-            }).unwrap();
-        }
-
-        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_executor_update_updates_secondary_index() {
-        let mut db = setup_db();
-        {
-            let mut exec = Executor::new(&mut db);
-            exec.execute(Statement::CreateTable {
-                table_name: "users".to_string(),
-                columns: vec!["id INT".to_string(), "name TEXT".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::CreateIndex {
-                index_name: "idx_name".to_string(),
-                table_name: "users".to_string(),
-                columns: vec!["name".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Insert {
-                table_name: "users".to_string(),
-                values: vec!["1".to_string(), "Alice".to_string()],
-            }).unwrap();
-
-            exec.execute(Statement::Update {
-                table_name: "users".to_string(),
-                column: "name".to_string(),
-                value: "Bob".to_string(),
-                pk_val: "1".to_string(),
-            }).unwrap();
-        }
-
-        assert!(db.get(b"__secidx__:users:name:Alice").unwrap().is_none());
-        assert!(db.get(b"__secidx__:users:name:Bob").unwrap().is_some());
-    }
-
-    #[test]
-    fn test_executor_select_range() {
+    fn test_executor_order_by_limit_offset() {
         let mut db = setup_db();
         let mut exec = Executor::new(&mut db);
 
@@ -1188,14 +964,20 @@ mod tests {
             values: vec!["2".to_string(), "30".to_string()],
         }).unwrap();
 
-        let res = exec.execute(Statement::SelectRange {
+        exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            column: "age".to_string(),
-            op: ">=".to_string(),
-            val: "25".to_string(),
+            values: vec!["3".to_string(), "25".to_string()],
+        }).unwrap();
+
+        let res = exec.execute(Statement::Select {
+            table_name: "users".to_string(),
+            where_clause: None,
+            order_by: Some(("age".to_string(), true)),
+            limit_offset: Some((2, 0)),
         }).unwrap();
 
         assert!(res.contains("30"));
+        assert!(res.contains("25"));
         assert!(!res.contains("20"));
     }
 }

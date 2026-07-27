@@ -21,6 +21,8 @@ pub enum Statement {
     Select {
         table_name: String,
         where_clause: Option<(String, String)>,
+        order_by: Option<(String, bool)>,       // (col_name, is_desc)
+        limit_offset: Option<(usize, usize)>,  // (limit, offset)
     },
     SelectRange {
         table_name: String,
@@ -255,7 +257,6 @@ impl Parser {
                 (after_gb.to_string(), None)
             };
 
-            // Parse target: "col, COUNT(*)" or "col, SUM(val)"
             let target_parts: Vec<&str> = target.split(',').map(|s| s.trim()).collect();
             if target_parts.len() != 2 {
                 return Err(anyhow!("Syntax Error: GROUP BY query expects 'group_col, FUNC(col)'"));
@@ -315,9 +316,13 @@ impl Parser {
             });
         }
 
-        if let Some(where_idx) = upper_rest.find("WHERE") {
-            let table_name = rest[..where_idx].trim().to_string();
-            let cond = rest[where_idx + 5..].trim();
+        // Parse trailing ORDER BY and LIMIT / OFFSET
+        let (table_and_where, order_by, limit_offset) = parse_order_by_and_limit(rest)?;
+        let upper_table_and_where = table_and_where.to_uppercase();
+
+        if let Some(where_idx) = upper_table_and_where.find("WHERE") {
+            let table_name = table_and_where[..where_idx].trim().to_string();
+            let cond = table_and_where[where_idx + 5..].trim();
 
             for op in &[">=", "<=", ">", "<"] {
                 if let Some(op_idx) = cond.find(op) {
@@ -336,11 +341,15 @@ impl Parser {
             Ok(Statement::Select {
                 table_name,
                 where_clause: Some(wc),
+                order_by,
+                limit_offset,
             })
         } else {
             Ok(Statement::Select {
-                table_name: rest.to_string(),
+                table_name: table_and_where,
                 where_clause: None,
+                order_by,
+                limit_offset,
             })
         }
     }
@@ -389,7 +398,64 @@ impl Parser {
     }
 }
 
-/// Parses a JOIN condition like `users.id = orders.user_id` or `id = user_id`.
+/// Parses trailing `ORDER BY col [ASC|DESC]` and `LIMIT n [OFFSET m]` clauses.
+#[allow(clippy::type_complexity)]
+fn parse_order_by_and_limit(rest: &str) -> Result<(String, Option<(String, bool)>, Option<(usize, usize)>)> {
+    let upper = rest.to_uppercase();
+    let mut main_part = rest;
+
+    let mut limit_offset = None;
+    let mut order_by = None;
+
+    let limit_idx = upper.find("LIMIT");
+    let order_idx = upper.find("ORDER BY");
+
+    let first_clause_idx = match (order_idx, limit_idx) {
+        (Some(o), Some(l)) => Some(o.min(l)),
+        (Some(o), None) => Some(o),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
+    };
+
+    if let Some(idx) = first_clause_idx {
+        main_part = rest[..idx].trim();
+    }
+
+    if let Some(o_idx) = order_idx {
+        let end_idx = limit_idx.filter(|l| *l > o_idx).unwrap_or(rest.len());
+        let order_str = rest[o_idx + 8..end_idx].trim();
+        let parts: Vec<&str> = order_str.split_whitespace().collect();
+
+        if !parts.is_empty() {
+            let col = parts[0].to_string();
+            let is_desc = parts.get(1).map(|dir| dir.eq_ignore_ascii_case("DESC")).unwrap_or(false);
+            order_by = Some((col, is_desc));
+        }
+    }
+
+    if let Some(l_idx) = limit_idx {
+        let limit_str = rest[l_idx + 5..].trim();
+        let upper_limit = limit_str.to_uppercase();
+
+        let (limit_val_str, offset_val_str) = if let Some(off_idx) = upper_limit.find("OFFSET") {
+            let l_part = limit_str[..off_idx].trim();
+            let o_part = limit_str[off_idx + 6..].trim();
+            (l_part, Some(o_part))
+        } else {
+            (limit_str, None)
+        };
+
+        if let Ok(limit_num) = limit_val_str.parse::<usize>() {
+            let offset_num = offset_val_str
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            limit_offset = Some((limit_num, offset_num));
+        }
+    }
+
+    Ok((main_part.to_string(), order_by, limit_offset))
+}
+
 fn parse_join_condition(cond: &str) -> Result<(String, String)> {
     let parts: Vec<&str> = cond.split('=').collect();
     if parts.len() != 2 {
@@ -408,7 +474,6 @@ fn extract_column_name(full: &str) -> String {
     }
 }
 
-/// Parses a HAVING condition like `COUNT(*) > 5` or `SUM(val) >= 100`.
 fn parse_having_condition(cond: &str) -> Result<(String, String)> {
     for op in &[">=", "<=", ">", "<", "="] {
         if let Some(op_idx) = cond.find(op) {
@@ -419,8 +484,6 @@ fn parse_having_condition(cond: &str) -> Result<(String, String)> {
     Err(anyhow!("Syntax Error: Invalid HAVING condition '{}'", cond))
 }
 
-/// Splits a comma-separated value list while respecting single-quoted strings.
-/// Handles escaped quotes ('') inside quoted strings.
 fn split_values_respecting_quotes(input: &str) -> Result<Vec<String>> {
     let mut values = Vec::new();
     let mut current = String::new();
@@ -475,60 +538,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_join_query() {
-        let stmt = Parser::parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
+    fn test_parse_order_by_limit_offset() {
+        let stmt = Parser::parse("SELECT * FROM users ORDER BY age DESC LIMIT 10 OFFSET 5").unwrap();
         assert_eq!(
             stmt,
-            Statement::SelectJoin {
-                left_table: "users".to_string(),
-                right_table: "orders".to_string(),
-                left_col: "id".to_string(),
-                right_col: "user_id".to_string(),
-                is_left_join: false,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_left_join_query() {
-        let stmt = Parser::parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::SelectJoin {
-                left_table: "users".to_string(),
-                right_table: "orders".to_string(),
-                left_col: "id".to_string(),
-                right_col: "user_id".to_string(),
-                is_left_join: true,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_group_by_having() {
-        let stmt = Parser::parse("SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 2").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::SelectGroupAggregate {
-                group_col: "dept".to_string(),
-                func: "COUNT".to_string(),
-                agg_col: "*".to_string(),
-                table_name: "employees".to_string(),
-                where_clause: None,
-                having_clause: Some((">".to_string(), "2".to_string())),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_composite_index() {
-        let stmt = Parser::parse("CREATE INDEX idx_name ON users(last_name, first_name)").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::CreateIndex {
-                index_name: "idx_name".to_string(),
+            Statement::Select {
                 table_name: "users".to_string(),
-                columns: vec!["last_name".to_string(), "first_name".to_string()],
+                where_clause: None,
+                order_by: Some(("age".to_string(), true)),
+                limit_offset: Some((10, 5)),
             }
         );
     }

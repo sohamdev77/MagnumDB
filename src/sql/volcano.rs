@@ -201,7 +201,6 @@ impl ExecutionPlan for HashJoinExec {
         self.result_rows.clear();
         self.cursor = 0;
 
-        // Build phase: hash table over right relation key
         let mut hash_table: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         while let Some(right_row) = self.right.next()? {
             if self.right_key_idx < right_row.len() {
@@ -210,7 +209,6 @@ impl ExecutionPlan for HashJoinExec {
             }
         }
 
-        // Probe phase: stream left relation and join matching right rows
         while let Some(left_row) = self.left.next()? {
             if self.left_key_idx < left_row.len() {
                 let key = &left_row[self.left_key_idx];
@@ -221,7 +219,6 @@ impl ExecutionPlan for HashJoinExec {
                         self.result_rows.push(joined);
                     }
                 } else if self.join_type == JoinType::Left {
-                    // LEFT JOIN unmatched row with NULL fill
                     let mut joined = left_row.clone();
                     joined.extend(vec!["NULL".to_string(); self.right_num_cols]);
                     self.result_rows.push(joined);
@@ -255,7 +252,7 @@ pub struct HashGroupAggregateExec {
     child: Box<dyn ExecutionPlan>,
     group_col_idx: usize,
     agg_func: AggregateFunc,
-    having_op_val: Option<(String, String)>, // (op e.g. ">", val e.g. "5")
+    having_op_val: Option<(String, String)>,
     result_rows: Vec<Vec<String>>,
     cursor: usize,
 }
@@ -284,9 +281,7 @@ impl ExecutionPlan for HashGroupAggregateExec {
         self.result_rows.clear();
         self.cursor = 0;
 
-        // Group Key -> (count, sum)
         let mut groups: HashMap<String, (u64, f64)> = HashMap::new();
-        // Preserve order of group key discovery
         let mut group_keys = Vec::new();
 
         while let Some(row) = self.child.next()? {
@@ -297,7 +292,7 @@ impl ExecutionPlan for HashGroupAggregateExec {
                     (0, 0.0)
                 });
 
-                entry.0 += 1; // count
+                entry.0 += 1;
                 match self.agg_func {
                     AggregateFunc::Count => {}
                     AggregateFunc::Sum(col_idx) | AggregateFunc::Avg(col_idx) => {
@@ -325,7 +320,6 @@ impl ExecutionPlan for HashGroupAggregateExec {
                     }
                 };
 
-                // Check HAVING clause filtering if present
                 let mut passes_having = true;
                 if let Some((ref op, ref target_str)) = self.having_op_val {
                     if let Ok(target_num) = target_str.parse::<f64>() {
@@ -346,6 +340,142 @@ impl ExecutionPlan for HashGroupAggregateExec {
                     self.result_rows.push(vec![g_key, agg_val]);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Vec<String>>> {
+        if self.cursor < self.result_rows.len() {
+            let row = self.result_rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()?;
+        self.cursor = self.result_rows.len();
+        Ok(())
+    }
+}
+
+/// Sort Operator (`ORDER BY col [ASC|DESC]`).
+pub struct SortExec {
+    child: Box<dyn ExecutionPlan>,
+    sort_col_idx: usize,
+    is_desc: bool,
+    result_rows: Vec<Vec<String>>,
+    cursor: usize,
+}
+
+impl SortExec {
+    pub fn new(child: Box<dyn ExecutionPlan>, sort_col_idx: usize, is_desc: bool) -> Self {
+        Self {
+            child,
+            sort_col_idx,
+            is_desc,
+            result_rows: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+impl ExecutionPlan for SortExec {
+    fn open(&mut self) -> Result<()> {
+        self.child.open()?;
+        self.result_rows.clear();
+        self.cursor = 0;
+
+        while let Some(row) = self.child.next()? {
+            self.result_rows.push(row);
+        }
+
+        let idx = self.sort_col_idx;
+        let is_desc = self.is_desc;
+
+        self.result_rows.sort_by(|a, b| {
+            let val_a = a.get(idx).map(|s| s.as_str()).unwrap_or("");
+            let val_b = b.get(idx).map(|s| s.as_str()).unwrap_or("");
+
+            let ord = match (val_a.parse::<f64>(), val_b.parse::<f64>()) {
+                (Ok(num_a), Ok(num_b)) => num_a.partial_cmp(&num_b).unwrap_or(std::cmp::Ordering::Equal),
+                _ => val_a.cmp(val_b),
+            };
+
+            if is_desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Vec<String>>> {
+        if self.cursor < self.result_rows.len() {
+            let row = self.result_rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()?;
+        self.cursor = self.result_rows.len();
+        Ok(())
+    }
+}
+
+/// Limit & Offset Operator (`LIMIT n [OFFSET m]`).
+pub struct LimitOffsetExec {
+    child: Box<dyn ExecutionPlan>,
+    limit: Option<usize>,
+    offset: usize,
+    result_rows: Vec<Vec<String>>,
+    cursor: usize,
+}
+
+impl LimitOffsetExec {
+    pub fn new(child: Box<dyn ExecutionPlan>, limit: Option<usize>, offset: usize) -> Self {
+        Self {
+            child,
+            limit,
+            offset,
+            result_rows: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+impl ExecutionPlan for LimitOffsetExec {
+    fn open(&mut self) -> Result<()> {
+        self.child.open()?;
+        self.result_rows.clear();
+        self.cursor = 0;
+
+        let mut skipped = 0;
+        let mut count = 0;
+
+        while let Some(row) = self.child.next()? {
+            if skipped < self.offset {
+                skipped += 1;
+                continue;
+            }
+
+            if let Some(l) = self.limit {
+                if count >= l {
+                    break;
+                }
+            }
+
+            self.result_rows.push(row);
+            count += 1;
         }
 
         Ok(())
