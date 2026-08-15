@@ -298,3 +298,89 @@ fn test_advanced_sql() {
     assert!(res_win.contains("3 row(s)"));
     assert!(res_win.contains("row_number"));
 }
+
+#[test]
+fn test_advanced_sql_more_subqueries() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE dept(id INT, dname TEXT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("CREATE TABLE emp(id INT, name TEXT, dept_id INT)").unwrap()).unwrap();
+
+    exec.execute(Parser::parse("INSERT INTO dept VALUES(1, 'Engineering')").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO dept VALUES(2, 'Sales')").unwrap()).unwrap();
+
+    exec.execute(Parser::parse("INSERT INTO emp VALUES(10, 'Alice', 1)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO emp VALUES(20, 'Bob', 2)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO emp VALUES(30, 'Charlie', 3)").unwrap()).unwrap(); // No such dept
+
+    let res = exec.execute(Parser::parse("SELECT * FROM emp WHERE dept_id IN (SELECT id FROM dept)").unwrap()).unwrap();
+    assert!(res.contains("Alice"));
+    assert!(res.contains("Bob"));
+    assert!(!res.contains("Charlie"));
+}
+
+#[test]
+fn test_advanced_sql_more_ctes() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE nums(val INT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO nums VALUES(1)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO nums VALUES(2)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO nums VALUES(3)").unwrap()).unwrap();
+
+    let res = exec.execute(Parser::parse("WITH temp1 AS (SELECT * FROM nums WHERE val = 2) SELECT * FROM temp1").unwrap()).unwrap();
+    assert!(res.contains("1 row(s)"));
+    assert!(res.contains("2"));
+    assert!(!res.contains("1"));
+    assert!(!res.contains("3"));
+}
+
+#[test]
+fn test_advanced_sql_more_window_functions() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE scores(player TEXT, score INT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO scores VALUES('P1', 100)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO scores VALUES('P1', 200)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO scores VALUES('P2', 150)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO scores VALUES('P2', 50)").unwrap()).unwrap();
+
+    // Partition by player, order by score
+    let res = exec.execute(Parser::parse("SELECT ROW_NUMBER() OVER(PARTITION BY player ORDER BY score) FROM scores").unwrap()).unwrap();
+    assert!(res.contains("4 row(s)"));
+    
+    let res_str = res.to_string();
+    assert!(res_str.contains("P1 | 100 | 1"));
+    assert!(res_str.contains("P1 | 200 | 2"));
+    assert!(res_str.contains("P2 | 50 | 1"));
+    assert!(res_str.contains("P2 | 150 | 2"));
+}
+
+#[test]
+fn test_advanced_sql_more_unions() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE A(val INT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("CREATE TABLE B(val INT)").unwrap()).unwrap();
+
+    exec.execute(Parser::parse("INSERT INTO A VALUES(10)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO A VALUES(20)").unwrap()).unwrap();
+
+    exec.execute(Parser::parse("INSERT INTO B VALUES(20)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO B VALUES(30)").unwrap()).unwrap();
+
+    let res_union = exec.execute(Parser::parse("SELECT * FROM A UNION SELECT * FROM B").unwrap()).unwrap();
+    assert!(res_union.contains("3 row(s)")); // 10, 20, 30
+
+    let res_union_all = exec.execute(Parser::parse("SELECT * FROM A UNION ALL SELECT * FROM B").unwrap()).unwrap();
+    assert!(res_union_all.contains("4 row(s)")); // 10, 20, 20, 30
+}
+

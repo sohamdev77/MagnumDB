@@ -52,7 +52,7 @@ MagnumDB exposes a basic heuristic, rule-based SQL planner and Volcano-style exe
 | `DELETE` | ✅ | Supports deletion with optional `WHERE` filtering. |
 | `DROP TABLE` | ✅ | Drops table and its associated indexes from storage catalog. |
 | `ALTER TABLE` | ✅ | Supports `ADD COLUMN`. |
-| **Constraints**| ✅ | `UNIQUE`, `DEFAULT`, and `NOT NULL` are now strictly enforced. (Note: `PRIMARY KEY` and `FOREIGN KEY` are parsed but defer to `UNIQUE` indexing logic). |
+| **Constraints**| ⚠️ | `UNIQUE`, `DEFAULT`, and `NOT NULL` are strictly enforced. `PRIMARY KEY` acts as a `UNIQUE` index. `FOREIGN KEY` syntax is parsed but referential integrity is **not** currently enforced. |
 | **Advanced SQL** | ✅ | Subqueries (`IN (SELECT...)`), CTEs (`WITH`), Window Functions (`ROW_NUMBER() OVER(...)`), and `UNION` / `UNION ALL`. |
 
 ---
@@ -82,7 +82,7 @@ MagnumDB uses an append-only Write-Ahead Log (WAL) for durability. Writes are bu
 - **Default Credentials**: The server automatically provisions a `postgres` superuser with no password upon database initialization. You must connect as `postgres` and explicitly `CREATE USER ... WITH PASSWORD` to secure the instance.
 - **Isolation Level**: Currently only guarantees Read Committed isolation. Each statement receives a snapshot of committed data. Non-repeatable reads and phantom reads are possible.
 - **RBAC**: We support user creation, but granular `GRANT`/`REVOKE` table-level permissions do not exist.
-- **SQL Error Behavior**: Duplicate rows (if unconstrained) are inserted. Invalid types may cause query panics or execution errors rather than graceful semantic errors.
+- **SQL Error Behavior**: Duplicate rows (if unconstrained) are inserted. Invalid types may cause query panics or execution errors rather than graceful semantic errors. (Robust type-checking is on the roadmap).
 
 ---
 
@@ -98,7 +98,7 @@ No comparative benchmark results are currently published. Performance metrics (i
 Add to `Cargo.toml`:
 ```toml
 [dependencies]
-magnumdb = "0.4.5"
+magnumdb = "0.4.7"
 ```
 
 ```rust
