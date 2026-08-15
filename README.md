@@ -10,7 +10,7 @@
 
 **Project Status:** Experimental / Alpha. Not recommended for production use.
 
-## What's New in v0.4.6
+## What's New in v0.4.7
 MagnumDB is an open-source educational database internals project. It provides:
 - An embedded key-value storage engine (B+ tree, WAL).
 - A basic relational SQL query execution engine (Volcano-style).
