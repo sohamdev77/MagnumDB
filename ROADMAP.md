@@ -35,8 +35,8 @@ This document outlines the roadmap and current completion state for MagnumDB.
 ## Phase 5: Client-Server Architecture
 - [x] Async Multi-Client TCP Server (Tokio runtime)
 - [x] PostgreSQL Wire Protocol (`pgwire` handler for `StartupMessage`, `Query`, `ReadyForQuery`)
-- [ ] User Authentication & Password Hashing
-- [ ] Role-Based Access Control (RBAC)
+- [x] User Authentication & Password Hashing
+- [x] Role-Based Access Control (RBAC)
 
 ## Phase 6: Distributed Mode
 - [ ] Replication Engine
