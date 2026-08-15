@@ -169,3 +169,45 @@ fn test_information_schema() {
     assert!(cols_res.contains("INTEGER"));
     assert!(cols_res.contains("TEXT"));
 }
+
+#[test]
+fn test_drop_table() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE dt(id INT PRIMARY KEY)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO dt VALUES(1)").unwrap()).unwrap();
+    
+    let res = exec.execute(Parser::parse("DROP TABLE dt").unwrap()).unwrap();
+    assert!(res.contains("Query OK"));
+    
+    let err = exec.execute(Parser::parse("SELECT * FROM dt").unwrap());
+    assert!(err.is_err());
+}
+
+#[test]
+fn test_update_and_delete() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE ud(id INT PRIMARY KEY, name TEXT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO ud VALUES(1, 'Alice'), (2, 'Bob'), (3, 'Charlie')").unwrap()).unwrap();
+
+    let res = exec.execute(Parser::parse("UPDATE ud SET name = 'Alicia' WHERE id = 1").unwrap()).unwrap();
+    assert!(res.contains("1 row updated"));
+
+    let select_res = exec.execute(Parser::parse("SELECT * FROM ud WHERE id = 1").unwrap()).unwrap();
+    assert!(select_res.contains("Alicia"));
+
+    let res_del = exec.execute(Parser::parse("DELETE FROM ud WHERE id = 2").unwrap()).unwrap();
+    assert!(res_del.contains("1 row deleted"));
+
+    let select_res_2 = exec.execute(Parser::parse("SELECT * FROM ud").unwrap()).unwrap();
+    assert!(!select_res_2.contains("Bob"));
+    
+    // Delete without where
+    let res_del_all = exec.execute(Parser::parse("DELETE FROM ud").unwrap()).unwrap();
+    assert!(res_del_all.contains("2 rows deleted"));
+}

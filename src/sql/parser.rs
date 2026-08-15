@@ -23,7 +23,7 @@ pub enum Statement {
     },
     Insert {
         table_name: String,
-        values: Vec<String>,
+        values_list: Vec<Vec<String>>,
     },
     Select {
         table_name: String,
@@ -62,11 +62,11 @@ pub enum Statement {
         table_name: String,
         column: String,
         value: String,
-        pk_val: String,
+        where_clause: Option<(String, String)>,
     },
     Delete {
         table_name: String,
-        pk_val: String,
+        where_clause: Option<(String, String)>,
     },
     DropTable {
         table_name: String,
@@ -228,18 +228,32 @@ impl Parser {
         let table_name_part = sql[11..values_idx].trim();
         let values_part = sql[values_idx + 6..].trim();
 
-        if !values_part.starts_with('(') || !values_part.ends_with(')') {
+        let mut values_list = Vec::new();
+        let mut current_vals = String::new();
+        let mut in_parens = false;
+        
+        for c in values_part.chars() {
+            if c == '(' {
+                in_parens = true;
+                current_vals.clear();
+            } else if c == ')' && in_parens {
+                in_parens = false;
+                let parsed_vals = split_values_respecting_quotes(&current_vals)?;
+                values_list.push(parsed_vals);
+            } else if in_parens {
+                current_vals.push(c);
+            }
+        }
+
+        if values_list.is_empty() {
             return Err(anyhow!(
-                "Syntax Error: VALUES must be enclosed in parentheses"
+                "Syntax Error: VALUES must contain at least one tuple enclosed in parentheses"
             ));
         }
 
-        let inner_vals = &values_part[1..values_part.len() - 1];
-        let values = split_values_respecting_quotes(inner_vals)?;
-
         Ok(Statement::Insert {
             table_name: table_name_part.to_string(),
-            values,
+            values_list,
         })
     }
 
@@ -396,36 +410,43 @@ impl Parser {
         let set_idx = upper_sql
             .find("SET")
             .ok_or_else(|| anyhow!("Syntax Error: Missing SET keyword"))?;
-        let where_idx = upper_sql
-            .find("WHERE")
-            .ok_or_else(|| anyhow!("Syntax Error: Missing WHERE keyword in UPDATE"))?;
 
-        let table_name = sql[6..set_idx].trim().to_string();
-        let set_expr = sql[set_idx + 3..where_idx].trim();
-        let where_expr = sql[where_idx + 5..].trim();
+        let (table_name, set_expr, where_clause) = if let Some(where_idx) = upper_sql.find("WHERE") {
+            let tname = sql[6..set_idx].trim().to_string();
+            let sexpr = sql[set_idx + 3..where_idx].trim();
+            let cond = sql[where_idx + 5..].trim();
+            let wc = parse_where_equality(cond)?;
+            (tname, sexpr, Some(wc))
+        } else {
+            let tname = sql[6..set_idx].trim().to_string();
+            let sexpr = sql[set_idx + 3..].trim();
+            (tname, sexpr, None)
+        };
 
         let (column, value) = parse_assignment(set_expr)?;
-        let (_, pk_val) = parse_assignment(where_expr)?;
 
         Ok(Statement::Update {
             table_name,
             column,
             value,
-            pk_val,
+            where_clause,
         })
     }
 
     fn parse_delete(sql: &str) -> Result<Statement> {
         let upper_sql = sql.to_uppercase();
-        let where_idx = upper_sql
-            .find("WHERE")
-            .ok_or_else(|| anyhow!("Syntax Error: Missing WHERE clause in DELETE"))?;
 
-        let table_name = sql[11..where_idx].trim().to_string();
-        let where_expr = sql[where_idx + 5..].trim();
-        let (_, pk_val) = parse_assignment(where_expr)?;
+        let (table_name, where_clause) = if let Some(where_idx) = upper_sql.find("WHERE") {
+            let tname = sql[11..where_idx].trim().to_string();
+            let cond = sql[where_idx + 5..].trim();
+            let wc = parse_where_equality(cond)?;
+            (tname, Some(wc))
+        } else {
+            let tname = sql[11..].trim().to_string();
+            (tname, None)
+        };
 
-        Ok(Statement::Delete { table_name, pk_val })
+        Ok(Statement::Delete { table_name, where_clause })
     }
 
     fn parse_drop_table(sql: &str) -> Result<Statement> {

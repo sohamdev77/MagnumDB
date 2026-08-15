@@ -240,7 +240,7 @@ impl<'a> Executor<'a> {
                     index_name, schema_name, t_name, cols_joined
                 ))
             }
-            Statement::Insert { table_name, values } => {
+            Statement::Insert { table_name, values_list } => {
                 let (schema_name, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
                     .get_schema_bytes(&t_name)?
@@ -252,52 +252,61 @@ impl<'a> Executor<'a> {
                 // Fetch full table schema if available to validate types and constraints
                 let catalog_schema = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)?;
 
-                if let Some(schema) = &catalog_schema {
-                    if values.len() != schema.columns.len() {
+                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
+                let mut inserted_count = 0;
+
+                for values in values_list {
+                    if let Some(schema) = &catalog_schema {
+                        if values.len() != schema.columns.len() {
+                            return Err(anyhow::anyhow!(
+                                "Column count mismatch: expected {}, got {}",
+                                schema.columns.len(),
+                                values.len()
+                            ));
+                        }
+
+                        // Validate typed values & NOT NULL constraints
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            let val_str = &values[i];
+                            let parsed_val = Value::parse_str(val_str, &col.data_type)?;
+                            if !col.is_nullable && parsed_val.is_null() {
+                                return Err(anyhow::anyhow!(
+                                    "Constraint Violation: Column '{}' cannot be NULL",
+                                    col.name
+                                ));
+                            }
+                        }
+                    } else if values.len() != col_names.len() {
                         return Err(anyhow::anyhow!(
                             "Column count mismatch: expected {}, got {}",
-                            schema.columns.len(),
+                            col_names.len(),
                             values.len()
                         ));
                     }
 
-                    // Validate typed values & NOT NULL constraints
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        let val_str = &values[i];
-                        let parsed_val = Value::parse_str(val_str, &col.data_type)?;
-                        if !col.is_nullable && parsed_val.is_null() {
-                            return Err(anyhow::anyhow!(
-                                "Constraint Violation: Column '{}' cannot be NULL",
-                                col.name
-                            ));
-                        }
+                    if values.is_empty() {
+                        return Err(anyhow::anyhow!("No values provided for insertion"));
                     }
-                } else if values.len() != col_names.len() {
-                    return Err(anyhow::anyhow!(
-                        "Column count mismatch: expected {}, got {}",
-                        col_names.len(),
-                        values.len()
-                    ));
+
+                    let pk = &values[0];
+                    let internal_key = format!("{}:{}", t_name, pk).into_bytes();
+                    let internal_val = encode_values_mvcc(&values, active_tx, 0);
+
+                    if self.in_transaction {
+                        self.write_buffer.insert(internal_key, Some(internal_val));
+                    } else {
+                        self.db.put(&internal_key, &internal_val)?;
+                    }
+
+                    self.sync_secondary_indexes_on_insert(&t_name, &col_names, &values, pk)?;
+                    inserted_count += 1;
                 }
 
-                if values.is_empty() {
-                    return Err(anyhow::anyhow!("No values provided for insertion"));
-                }
-
-                let pk = &values[0];
-                let internal_key = format!("{}:{}", t_name, pk).into_bytes();
-                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
-                let internal_val = encode_values_mvcc(&values, active_tx, 0);
-
-                if self.in_transaction {
-                    self.write_buffer.insert(internal_key, Some(internal_val));
+                if inserted_count == 1 {
+                    Ok("Query OK, 1 row inserted.".to_string())
                 } else {
-                    self.db.put(&internal_key, &internal_val)?;
+                    Ok(format!("Query OK, {} rows inserted.", inserted_count))
                 }
-
-                self.sync_secondary_indexes_on_insert(&t_name, &col_names, &values, pk)?;
-
-                Ok("Query OK, 1 row inserted.".to_string())
             }
             Statement::Select {
                 table_name,
@@ -687,7 +696,7 @@ impl<'a> Executor<'a> {
                 table_name,
                 column,
                 value,
-                pk_val,
+                where_clause,
             } => {
                 let (schema_name, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
@@ -720,73 +729,108 @@ impl<'a> Executor<'a> {
                     }
                 }
 
-                let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
-                let existing_bytes = if self.in_transaction
-                    && self.write_buffer.contains_key(&internal_key)
-                {
-                    self.write_buffer.get(&internal_key).cloned().flatten()
-                } else {
-                    self.db.get(&internal_key)?
-                };
-
-                let existing_bytes = existing_bytes
-                    .ok_or_else(|| anyhow::anyhow!("Row with primary key '{}' not found", pk_val))?;
-
-                let mut row_values = decode_values(&existing_bytes)?;
-                if col_idx >= row_values.len() {
-                    return Err(anyhow::anyhow!("Corrupted row length"));
-                }
-
-                let old_value = row_values[col_idx].clone();
-                self.sec_idx_remove_for_column(&t_name, &column, &old_value, &pk_val)?;
-
-                row_values[col_idx] = value.clone();
-
-                self.sec_idx_add_for_column(&t_name, &column, &value, &pk_val)?;
-
-                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
-                let updated_bytes = encode_values_mvcc(&row_values, active_tx, 0);
-
-                if self.in_transaction {
-                    self.write_buffer.insert(internal_key, Some(updated_bytes));
-                } else {
-                    self.db.put(&internal_key, &updated_bytes)?;
-                }
-
-                Ok("Query OK, 1 row updated.".to_string())
-            }
-            Statement::Delete { table_name, pk_val } => {
-                let (_, t_name) = parse_qualified_table_name(&table_name);
-                let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
-
-                let existing_bytes = if self.in_transaction
-                    && self.write_buffer.contains_key(&internal_key)
-                {
-                    self.write_buffer.get(&internal_key).cloned().flatten()
-                } else {
-                    self.db.get(&internal_key)?
-                };
-
-                if let Some(row_data) = existing_bytes {
-                    if let Ok(Some(sb)) = self.get_schema_bytes(&t_name) {
-                        if let Ok(schema_val) = String::from_utf8(sb) {
-                            let col_names = Self::extract_col_names(&schema_val);
-                            if let Ok(decoded) = decode_values(&row_data) {
-                                self.remove_all_secondary_indexes(
-                                    &t_name, &col_names, &decoded, &pk_val,
-                                )?;
-                            }
+                let mut rows_to_update = Vec::new();
+                
+                // Fetch rows
+                let rows = self.scan_table_rows(&t_name)?;
+                
+                if let Some((filter_col, filter_val)) = &where_clause {
+                    let filter_idx = col_names.iter().position(|name| name == filter_col).ok_or_else(
+                        || anyhow::anyhow!("Column '{}' not found", filter_col),
+                    )?;
+                    for row in rows {
+                        if row[filter_idx] == *filter_val {
+                            rows_to_update.push(row);
                         }
                     }
-                }
-
-                if self.in_transaction {
-                    self.write_buffer.insert(internal_key, None);
                 } else {
-                    self.db.delete(&internal_key)?;
+                    rows_to_update = rows;
                 }
 
-                Ok("Query OK, 1 row deleted.".to_string())
+                let mut updated_count = 0;
+                let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
+
+                for mut row_values in rows_to_update {
+                    if col_idx >= row_values.len() {
+                        return Err(anyhow::anyhow!("Corrupted row length"));
+                    }
+
+                    let pk_val = row_values[0].clone();
+                    let old_value = row_values[col_idx].clone();
+                    self.sec_idx_remove_for_column(&t_name, &column, &old_value, &pk_val)?;
+
+                    row_values[col_idx] = value.clone();
+
+                    self.sec_idx_add_for_column(&t_name, &column, &value, &pk_val)?;
+
+                    let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
+                    let updated_bytes = encode_values_mvcc(&row_values, active_tx, 0);
+
+                    if self.in_transaction {
+                        self.write_buffer.insert(internal_key, Some(updated_bytes));
+                    } else {
+                        self.db.put(&internal_key, &updated_bytes)?;
+                    }
+                    updated_count += 1;
+                }
+
+                if updated_count == 1 {
+                    Ok("Query OK, 1 row updated.".to_string())
+                } else {
+                    Ok(format!("Query OK, {} rows updated.", updated_count))
+                }
+            }
+            Statement::Delete { table_name, where_clause } => {
+                let (_, t_name) = parse_qualified_table_name(&table_name);
+                
+                let schema_bytes = self.get_schema_bytes(&t_name)?;
+                if schema_bytes.is_none() {
+                    return Err(anyhow::anyhow!("Table '{}' does not exist", table_name));
+                }
+                
+                let schema_val = String::from_utf8(schema_bytes.unwrap())?;
+                let col_names = Self::extract_col_names(&schema_val);
+
+                let mut rows_to_delete = Vec::new();
+                let rows = self.scan_table_rows(&t_name)?;
+                
+                if let Some((filter_col, filter_val)) = &where_clause {
+                    let filter_idx = col_names.iter().position(|name| name == filter_col).ok_or_else(
+                        || anyhow::anyhow!("Column '{}' not found", filter_col),
+                    )?;
+                    for row in rows {
+                        if row[filter_idx] == *filter_val {
+                            rows_to_delete.push(row);
+                        }
+                    }
+                } else {
+                    rows_to_delete = rows;
+                }
+
+                let mut deleted_count = 0;
+
+                for row_data in rows_to_delete {
+                    let pk_val = row_data[0].clone();
+                    let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
+
+                    self.remove_all_secondary_indexes(
+                        &t_name, &col_names, &row_data, &pk_val,
+                    )?;
+
+                    if self.in_transaction {
+                        self.write_buffer.insert(internal_key, None);
+                    } else {
+                        self.db.delete(&internal_key)?;
+                    }
+                    
+                    deleted_count += 1;
+                }
+
+                if deleted_count == 1 {
+                    Ok("Query OK, 1 row deleted.".to_string())
+                } else {
+                    Ok(format!("Query OK, {} rows deleted.", deleted_count))
+                }
             }
             Statement::DropTable { table_name } => {
                 let (schema_name, t_name) = parse_qualified_table_name(&table_name);
@@ -1132,18 +1176,21 @@ mod tests {
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            values: vec!["1".to_string(), "20".to_string()],
-        }).unwrap();
+            values_list: vec![vec!["1".to_string(), "20".to_string()]],
+        })
+        .unwrap();
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            values: vec!["2".to_string(), "30".to_string()],
-        }).unwrap();
+            values_list: vec![vec!["2".to_string(), "30".to_string()]],
+        })
+        .unwrap();
 
         exec.execute(Statement::Insert {
             table_name: "users".to_string(),
-            values: vec!["3".to_string(), "25".to_string()],
-        }).unwrap();
+            values_list: vec![vec!["3".to_string(), "25".to_string()]],
+        })
+        .unwrap();
 
         let res = exec.execute(Statement::Select {
             table_name: "users".to_string(),

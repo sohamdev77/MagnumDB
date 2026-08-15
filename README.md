@@ -48,7 +48,9 @@ MagnumDB exposes a basic heuristic, rule-based SQL planner and Volcano-style exe
 | Prepared Statements| ✅ | Supported via PostgreSQL Wire Protocol (`Parse`, `Bind`, `Execute`). |
 | Authentication | ✅ | MD5 Authentication (implemented for Postgres wire compatibility). |
 | `CREATE USER` | ✅ | Provisions users. (Output: `CREATE ROLE`). |
-| **Unsupported DML** | ❌ | `UPDATE`, `DELETE`, `DROP TABLE` are not yet supported. |
+| `UPDATE` | ✅ | Supports single-column update with optional `WHERE` filtering. |
+| `DELETE` | ✅ | Supports deletion with optional `WHERE` filtering. |
+| `DROP TABLE` | ✅ | Drops table and its associated indexes from storage catalog. |
 | **Unsupported DDL** | ❌ | `ALTER TABLE`, `CREATE INDEX`. (Internally, tables are clustered on an implicit 64-bit row ID, but secondary SQL indexes do not exist). |
 | **Unsupported Constraints**| ❌ | `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `DEFAULT`. `NOT NULL` is parsed but not strictly enforced in all executor paths. |
 | **Unsupported SQL** | ❌ | Subqueries, CTEs, Window Functions, `UNION`. |

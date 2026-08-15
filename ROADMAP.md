@@ -23,7 +23,8 @@ This document outlines the roadmap and current completion state for MagnumDB.
 - [x] SQL Parser (DDL, DML, Range Queries, Aggregates)
 - [x] Volcano Streaming Execution Iterator Engine (`SeqScanExec`, `FilterExec`, `AggregateExec`)
 - [x] Supported Commands: `CREATE TABLE`, `INSERT`, `SELECT`, `SHOW TABLES`
-- [ ] Unsupported Commands (Planned): `UPDATE`, `DELETE`, `DROP TABLE`, `CREATE INDEX`
+- [x] Basic DML Support: `UPDATE`, `DELETE`, `DROP TABLE`
+- [ ] Unsupported Commands (Planned): `CREATE INDEX`
 - [x] Aggregate Functions: `COUNT(*)`, `SUM(col)`, `AVG(col)`
 - [ ] Cost-Based Query Optimizer (CBO strategy selection)
 
