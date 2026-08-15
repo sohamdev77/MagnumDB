@@ -215,18 +215,23 @@ impl Node {
     }
 }
 
+use parking_lot::RwLock;
+
 /// The B+ Tree manager.
 pub struct BTree {
     buffer_pool: BufferPool,
-    root_page_id: PageId,
+    root_page_id: RwLock<PageId>,
 }
 
 impl BTree {
     pub fn new(mut buffer_pool: BufferPool) -> anyhow::Result<Self> {
         let meta_page = buffer_pool.fetch_page(0)?;
-        let stored_root = u32::from_le_bytes(
-            meta_page.data[META_ROOT_PAGE_RANGE].try_into().unwrap_or([0; 4]),
-        );
+        let stored_root = {
+            let guard = meta_page.read();
+            u32::from_le_bytes(
+                guard.data[META_ROOT_PAGE_RANGE].try_into().unwrap_or([0; 4]),
+            )
+        };
 
         let root_page_id = if stored_root == 0 || stored_root == u32::MAX {
             // Page 1: Root leaf
@@ -240,9 +245,13 @@ impl BTree {
             buffer_pool.write_page(new_page_id, &empty_leaf.to_page()?)?;
 
             // Write metadata to Page 0
-            let mut meta_page = buffer_pool.fetch_page(0)?;
-            meta_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&new_page_id.to_le_bytes());
-            buffer_pool.write_page(0, &meta_page)?;
+            let meta_page_ref = buffer_pool.fetch_page(0)?;
+            let mut cloned_page = {
+                let guard = meta_page_ref.read();
+                guard.clone()
+            };
+            cloned_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&new_page_id.to_le_bytes());
+            buffer_pool.write_page(0, &cloned_page)?;
 
             new_page_id
         } else {
@@ -251,47 +260,52 @@ impl BTree {
 
         Ok(Self {
             buffer_pool,
-            root_page_id,
+            root_page_id: RwLock::new(root_page_id),
         })
     }
 
-    fn persist_root_page_id(&mut self, root_page_id: PageId) -> anyhow::Result<()> {
-        let mut meta_page = self.buffer_pool.fetch_page(0)?;
-        meta_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&root_page_id.to_le_bytes());
-        self.buffer_pool.write_page(0, &meta_page)?;
+    fn persist_root_page_id(&self, root_page_id: PageId) -> anyhow::Result<()> {
+        let meta_page_ref = self.buffer_pool.fetch_page(0)?;
+        let mut cloned_page = {
+            let guard = meta_page_ref.read();
+            guard.clone()
+        };
+        cloned_page.data[META_ROOT_PAGE_RANGE].copy_from_slice(&root_page_id.to_le_bytes());
+        self.buffer_pool.write_page(0, &cloned_page)?;
         Ok(())
     }
 
-    pub fn flush_all(&mut self) -> anyhow::Result<()> {
+    pub fn flush_all(&self) -> anyhow::Result<()> {
         self.buffer_pool.flush_all()
     }
 
-    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+    pub fn flush_and_sync(&self) -> anyhow::Result<()> {
         self.buffer_pool.flush_and_sync()
     }
 
-    pub fn sync(&mut self) -> anyhow::Result<()> {
+    pub fn sync(&self) -> anyhow::Result<()> {
         self.buffer_pool.sync()
     }
 
-    /// Returns a mutable reference to the underlying buffer pool.
-    pub fn buffer_pool_mut(&mut self) -> &mut BufferPool {
-        &mut self.buffer_pool
+    /// Returns a reference to the underlying buffer pool.
+    pub fn buffer_pool(&self) -> &BufferPool {
+        &self.buffer_pool
     }
 
-    fn read_node(&mut self, page_id: PageId) -> anyhow::Result<Node> {
-        let page = self.buffer_pool.fetch_page(page_id)?;
-        Ok(Node::from_page(&page))
+    fn read_node(&self, page_id: PageId) -> anyhow::Result<Node> {
+        let page_ref = self.buffer_pool.fetch_page(page_id)?;
+        let guard = page_ref.read();
+        Ok(Node::from_page(&*guard))
     }
 
-    fn write_node(&mut self, page_id: PageId, node: &Node) -> anyhow::Result<()> {
+    fn write_node(&self, page_id: PageId, node: &Node) -> anyhow::Result<()> {
         let page = node.to_page()?;
         self.buffer_pool.write_page(page_id, &page)?;
         Ok(())
     }
 
     /// Stores a large value across overflow pages and returns the overflow record handle.
-    fn write_overflow_value(&mut self, value: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn write_overflow_value(&self, value: &[u8]) -> anyhow::Result<Vec<u8>> {
         let chunk_size = PAGE_SIZE - 4;
         let chunks: Vec<&[u8]> = value.chunks(chunk_size).collect();
 
@@ -323,7 +337,7 @@ impl BTree {
     }
 
     /// Reassembles value from overflow pages if it contains an overflow handle.
-    fn read_value_resolve_overflow(&mut self, val_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn read_value_resolve_overflow(&self, val_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         if val_bytes.len() == 12 && &val_bytes[0..4] == OVERFLOW_MAGIC {
             let total_len = u32::from_le_bytes(val_bytes[4..8].try_into().unwrap_or([0; 4])) as usize;
             let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap_or([0; 4]));
@@ -332,13 +346,15 @@ impl BTree {
             let chunk_capacity = PAGE_SIZE - 4;
 
             while curr_page_id != u32::MAX {
-                let page = self.buffer_pool.fetch_page(curr_page_id)?;
-                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap_or([0xFF; 4]));
-
-                let remaining = total_len - result.len();
-                let take_len = remaining.min(chunk_capacity);
-
-                result.extend_from_slice(&page.data[4..4 + take_len]);
+                let page_ref = self.buffer_pool.fetch_page(curr_page_id)?;
+                let next_page_id = {
+                    let guard = page_ref.read();
+                    let next = u32::from_le_bytes(guard.data[0..4].try_into().unwrap_or([0xFF; 4]));
+                    let remaining = total_len - result.len();
+                    let take_len = remaining.min(chunk_capacity);
+                    result.extend_from_slice(&guard.data[4..4 + take_len]);
+                    next
+                };
                 curr_page_id = next_page_id;
             }
 
@@ -349,12 +365,15 @@ impl BTree {
     }
 
     /// Frees overflow pages associated with a record handle.
-    fn free_overflow_chain(&mut self, val_bytes: &[u8]) -> anyhow::Result<()> {
+    fn free_overflow_chain(&self, val_bytes: &[u8]) -> anyhow::Result<()> {
         if val_bytes.len() == 12 && &val_bytes[0..4] == OVERFLOW_MAGIC {
             let mut curr_page_id = u32::from_le_bytes(val_bytes[8..12].try_into().unwrap_or([0; 4]));
             while curr_page_id != u32::MAX {
-                let page = self.buffer_pool.fetch_page(curr_page_id)?;
-                let next_page_id = u32::from_le_bytes(page.data[0..4].try_into().unwrap_or([0xFF; 4]));
+                let page_ref = self.buffer_pool.fetch_page(curr_page_id)?;
+                let next_page_id = {
+                    let guard = page_ref.read();
+                    u32::from_le_bytes(guard.data[0..4].try_into().unwrap_or([0xFF; 4]))
+                };
                 self.buffer_pool.free_page(curr_page_id)?;
                 curr_page_id = next_page_id;
             }
@@ -363,7 +382,7 @@ impl BTree {
     }
 
     /// Inserts a key-value pair into the BTree.
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+    pub fn insert(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         if key.len() > MAX_KEY_SIZE {
             return Err(anyhow::anyhow!(
                 "Key size {} exceeds maximum allowed {}",
@@ -378,9 +397,10 @@ impl BTree {
             value.to_vec()
         };
 
-        let root_node = self.read_node(self.root_page_id)?;
+        let root_id = *self.root_page_id.read();
+        let root_node = self.read_node(root_id)?;
         let (leaf_id, mut leaf_node) =
-            self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+            self.find_leaf_for_insert(root_id, &root_node, key)?;
 
         let pos = leaf_node
             .records
@@ -408,7 +428,7 @@ impl BTree {
     }
 
     fn find_leaf_for_insert(
-        &mut self,
+        &self,
         current_id: PageId,
         current_node: &Node,
         key: &[u8],
@@ -431,7 +451,7 @@ impl BTree {
     }
 
     fn split_leaf_and_insert(
-        &mut self,
+        &self,
         leaf_id: PageId,
         mut leaf_node: LeafNode,
     ) -> anyhow::Result<()> {
@@ -472,7 +492,7 @@ impl BTree {
             }
             self.write_node(new_leaf_id, &right_leaf)?;
 
-            self.root_page_id = new_root_id;
+            *self.root_page_id.write() = new_root_id;
             self.persist_root_page_id(new_root_id)?;
         }
 
@@ -480,7 +500,7 @@ impl BTree {
     }
 
     fn insert_into_internal(
-        &mut self,
+        &self,
         parent_id: PageId,
         key: Vec<u8>,
         right_child_id: PageId,
@@ -502,7 +522,7 @@ impl BTree {
     }
 
     fn split_internal_and_insert(
-        &mut self,
+        &self,
         internal_id: PageId,
         mut internal_node: InternalNode,
     ) -> anyhow::Result<()> {
@@ -551,7 +571,7 @@ impl BTree {
             }
             self.write_node(new_internal_id, &right_internal)?;
 
-            self.root_page_id = new_root_id;
+            *self.root_page_id.write() = new_root_id;
             self.persist_root_page_id(new_root_id)?;
         }
 
@@ -559,9 +579,10 @@ impl BTree {
     }
 
     /// Retrieves a value by key.
-    pub fn search(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        let root_node = self.read_node(self.root_page_id)?;
-        let (_, leaf_node) = self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+    pub fn search(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let root_id = *self.root_page_id.read();
+        let root_node = self.read_node(root_id)?;
+        let (_, leaf_node) = self.find_leaf_for_insert(root_id, &root_node, key)?;
 
         if let Ok(pos) = leaf_node
             .records
@@ -576,17 +597,18 @@ impl BTree {
     }
 
     /// Scans all records in the BTree (table scan).
-    pub fn scan(&mut self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix(b"")
     }
 
     /// Scans only records matching a specific key prefix.
-    pub fn scan_prefix(&mut self, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
 
-        let root_node = self.read_node(self.root_page_id)?;
+        let root_id = *self.root_page_id.read();
+        let root_node = self.read_node(root_id)?;
         let (_current_id, mut current_leaf) =
-            self.find_leaf_for_insert(self.root_page_id, &root_node, prefix)?;
+            self.find_leaf_for_insert(root_id, &root_node, prefix)?;
 
         'outer: loop {
             for rec in &current_leaf.records {
@@ -618,10 +640,11 @@ impl BTree {
 
     /// Deletes a key from the BTree.
     /// If the leaf becomes empty after deletion, the page is freed and sibling pointers are updated.
-    pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
-        let root_node = self.read_node(self.root_page_id)?;
+    pub fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+        let root_id = *self.root_page_id.read();
+        let root_node = self.read_node(root_id)?;
         let (leaf_id, mut leaf_node) =
-            self.find_leaf_for_insert(self.root_page_id, &root_node, key)?;
+            self.find_leaf_for_insert(root_id, &root_node, key)?;
 
         if let Ok(pos) = leaf_node
             .records
@@ -631,7 +654,7 @@ impl BTree {
             self.free_overflow_chain(&removed.1)?;
 
             // If the leaf is empty and it's not the root, free the page
-            if leaf_node.records.is_empty() && leaf_id != self.root_page_id {
+            if leaf_node.records.is_empty() && leaf_id != root_id {
                 // Update the previous leaf's next_leaf pointer to skip this leaf.
                 // We do a scan from the leftmost leaf to find the previous sibling.
                 self.unlink_empty_leaf(leaf_id, &leaf_node)?;
@@ -644,9 +667,10 @@ impl BTree {
     }
 
     /// Unlinks an empty leaf from the sibling chain and frees its page.
-    fn unlink_empty_leaf(&mut self, leaf_id: PageId, leaf_node: &LeafNode) -> anyhow::Result<()> {
+    fn unlink_empty_leaf(&self, leaf_id: PageId, leaf_node: &LeafNode) -> anyhow::Result<()> {
+        let root_id = *self.root_page_id.read();
         // Find the leftmost leaf by traversing from root
-        let leftmost_leaf_id = self.find_leftmost_leaf(self.root_page_id)?;
+        let leftmost_leaf_id = self.find_leftmost_leaf(root_id)?;
 
         if leftmost_leaf_id == leaf_id {
             // This is the leftmost leaf, just write it empty (don't free root-adjacent leaves
@@ -683,7 +707,7 @@ impl BTree {
     }
 
     /// Finds the leftmost leaf page by always taking the first child from root.
-    fn find_leftmost_leaf(&mut self, page_id: PageId) -> anyhow::Result<PageId> {
+    fn find_leftmost_leaf(&self, page_id: PageId) -> anyhow::Result<PageId> {
         let node = self.read_node(page_id)?;
         match node {
             Node::Leaf(_) => Ok(page_id),
@@ -788,7 +812,8 @@ mod tests {
             );
         }
 
-        let root = btree.read_node(btree.root_page_id).unwrap();
+        let root_id = *btree.root_page_id.read();
+        let root = btree.read_node(root_id).unwrap();
         assert!(matches!(root, Node::Internal(_)));
     }
 

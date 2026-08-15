@@ -8,11 +8,11 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 pub struct PgWireHandler {
-    db: Arc<RwLock<Database>>,
+    db: Arc<Database>,
 }
 
 impl PgWireHandler {
-    pub fn new(db: Arc<RwLock<Database>>) -> Self {
+    pub fn new(db: Arc<Database>) -> Self {
         Self { db }
     }
 
@@ -136,8 +136,7 @@ impl PgWireHandler {
 
     async fn execute_and_respond(&self, socket: &mut TcpStream, sql: &str) -> Result<()> {
         let exec_res = {
-            let mut guard = self.db.write().await;
-            let mut executor = Executor::new(&mut guard);
+            let mut executor = Executor::new(&*self.db);
             match Parser::parse(sql) {
                 Ok(stmt) => executor.execute(stmt),
                 Err(e) => Err(e),

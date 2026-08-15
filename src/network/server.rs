@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 
 pub struct Server {
-    db: Arc<RwLock<Database>>,
+    db: Arc<Database>,
     addr: String,
     max_connections: usize,
     idle_timeout: Duration,
@@ -18,7 +18,7 @@ pub struct Server {
 impl Server {
     pub fn new(db: Database, addr: String) -> Self {
         Self {
-            db: Arc::new(RwLock::new(db)),
+            db: Arc::new(db),
             addr,
             max_connections: 128,
             idle_timeout: Duration::from_secs(30),
@@ -102,8 +102,7 @@ impl Server {
                     let query = String::from_utf8_lossy(&query_buf);
 
                     let response = {
-                        let mut guard = db_ref.write().await;
-                        let mut executor = Executor::new(&mut guard);
+                        let mut executor = Executor::new(&db_ref);
                         match Parser::parse(&query) {
                             Ok(stmt) => match executor.execute(stmt) {
                                 Ok(res) => res,

@@ -1,4 +1,6 @@
+use crate::sql::catalog::{CatalogManager, DEFAULT_SCHEMA};
 use crate::sql::parser::Statement;
+use crate::sql::types::{ColumnDef, DataType, TableSchema, Value};
 use crate::sql::volcano::{
     AggregateExec, AggregateFunc, ExecutionPlan, FilterExec, HashGroupAggregateExec, HashJoinExec,
     JoinType, LimitOffsetExec, SeqScanExec, SortExec,
@@ -34,15 +36,12 @@ fn decode_values(data: &[u8]) -> Result<Vec<String>> {
     let mut values = Vec::new();
     let mut offset = 0;
 
-    // Check if data contains 16-byte MVCC header
     if data.len() >= 16 {
-        // Skip xmin (8B) and xmax (8B) header for string value decoding
         offset = 16;
     }
 
     while offset < data.len() {
         if offset + 4 > data.len() {
-            // Fallback for legacy format without MVCC header
             offset = 0;
             values.clear();
             while offset < data.len() {
@@ -77,14 +76,15 @@ fn decode_values(data: &[u8]) -> Result<Vec<String>> {
 const SEC_IDX_PK_SEP: &str = "\x1F"; // ASCII Unit Separator
 
 pub struct Executor<'a> {
-    db: &'a mut Database,
+    db: &'a Database,
     in_transaction: bool,
     current_tx_id: u64,
     write_buffer: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(db: &'a mut Database) -> Self {
+    pub fn new(db: &'a Database) -> Self {
+        let _ = CatalogManager::init_default_schema(db);
         Self {
             db,
             in_transaction: false,
@@ -132,15 +132,37 @@ impl<'a> Executor<'a> {
                 self.current_tx_id = 0;
                 Ok("Query OK, transaction rolled back.".to_string())
             }
+            Statement::CreateSchema { schema_name } => {
+                CatalogManager::create_schema(self.db, &schema_name)?;
+                Ok(format!("Query OK, schema '{}' created.", schema_name))
+            }
+            Statement::ShowSchemas => {
+                let schemas = CatalogManager::list_schemas(self.db)?;
+                let mut output =
+                    "+-----------------+\n| Schemas |\n+-----------------+\n".to_string();
+                for s in &schemas {
+                    output.push_str(&format!("| {} |\n", s));
+                }
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} schema(s) in set.", schemas.len()));
+                Ok(output)
+            }
             Statement::CreateTable {
                 table_name,
                 columns,
             } => {
-                let schema_key = format!("__schema__:{}", table_name);
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
+                let schema_key = format!("__schema__:{}", t_name);
 
-                if self.get_schema_bytes(&table_name)?.is_some() {
+                if self.get_schema_bytes(&t_name)?.is_some()
+                    || CatalogManager::get_table_schema(self.db, &schema_name, &t_name)?.is_some()
+                {
                     return Err(anyhow::anyhow!("Table '{}' already exists", table_name));
                 }
+
+                let col_defs: Vec<ColumnDef> = columns.iter().map(|c| parse_column_def(c)).collect();
+                let table_schema = TableSchema::new(schema_name.clone(), t_name.clone(), col_defs);
+                CatalogManager::save_table_schema(self.db, &table_schema)?;
 
                 let schema_val = columns.join(",");
                 if self.in_transaction {
@@ -150,18 +172,24 @@ impl<'a> Executor<'a> {
                     self.db.put(schema_key.as_bytes(), schema_val.as_bytes())?;
                 }
 
-                Ok(format!("Query OK, table '{}' created.", table_name))
+                let msg = if schema_name == DEFAULT_SCHEMA {
+                    format!("Query OK, table '{}' created.", t_name)
+                } else {
+                    format!("Query OK, table '{}.{}' created.", schema_name, t_name)
+                };
+                Ok(msg)
             }
             Statement::CreateIndex {
                 index_name,
                 table_name,
                 columns,
             } => {
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
 
-                let idx_meta_key = format!("__index__:{}:{}", table_name, index_name);
+                let idx_meta_key = format!("__index__:{}:{}", t_name, index_name);
                 if self.db.get(idx_meta_key.as_bytes())?.is_some() {
                     return Err(anyhow::anyhow!("Index '{}' already exists", index_name));
                 }
@@ -180,7 +208,7 @@ impl<'a> Executor<'a> {
                     col_indices.push(idx);
                 }
 
-                let prefix = format!("{}:", table_name);
+                let prefix = format!("{}:", t_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
 
                 for (key, val) in records {
@@ -195,28 +223,51 @@ impl<'a> Executor<'a> {
                         let composite_val = col_vals.join("+");
                         let pk = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                         let column_key = columns.join("+");
-                        self.sec_idx_add(&table_name, &column_key, &composite_val, &pk)?;
+                        self.sec_idx_add(&t_name, &column_key, &composite_val, &pk)?;
                     }
                 }
 
                 Ok(format!(
-                    "Query OK, index '{}' created on '{}({})'.",
-                    index_name, table_name, cols_joined
+                    "Query OK, index '{}' created on '{}.{}({})'.",
+                    index_name, schema_name, t_name, cols_joined
                 ))
             }
             Statement::Insert { table_name, values } => {
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
 
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
-                let col_defs: Vec<&str> = schema_val.split(',').collect();
 
-                if values.len() != col_defs.len() {
+                // Fetch full table schema if available to validate types and constraints
+                let catalog_schema = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)?;
+
+                if let Some(schema) = &catalog_schema {
+                    if values.len() != schema.columns.len() {
+                        return Err(anyhow::anyhow!(
+                            "Column count mismatch: expected {}, got {}",
+                            schema.columns.len(),
+                            values.len()
+                        ));
+                    }
+
+                    // Validate typed values & NOT NULL constraints
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        let val_str = &values[i];
+                        let parsed_val = Value::parse_str(val_str, &col.data_type)?;
+                        if !col.is_nullable && parsed_val.is_null() {
+                            return Err(anyhow::anyhow!(
+                                "Constraint Violation: Column '{}' cannot be NULL",
+                                col.name
+                            ));
+                        }
+                    }
+                } else if values.len() != col_names.len() {
                     return Err(anyhow::anyhow!(
                         "Column count mismatch: expected {}, got {}",
-                        col_defs.len(),
+                        col_names.len(),
                         values.len()
                     ));
                 }
@@ -226,7 +277,7 @@ impl<'a> Executor<'a> {
                 }
 
                 let pk = &values[0];
-                let internal_key = format!("{}:{}", table_name, pk).into_bytes();
+                let internal_key = format!("{}:{}", t_name, pk).into_bytes();
                 let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
                 let internal_val = encode_values_mvcc(&values, active_tx, 0);
 
@@ -236,7 +287,7 @@ impl<'a> Executor<'a> {
                     self.db.put(&internal_key, &internal_val)?;
                 }
 
-                self.sync_secondary_indexes_on_insert(&table_name, &col_names, &values, pk)?;
+                self.sync_secondary_indexes_on_insert(&t_name, &col_names, &values, pk)?;
 
                 Ok("Query OK, 1 row inserted.".to_string())
             }
@@ -246,59 +297,97 @@ impl<'a> Executor<'a> {
                 order_by,
                 limit_offset,
             } => {
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
+
+                // Handle virtual system catalog queries
+                if t_name.eq_ignore_ascii_case("information_schema.tables")
+                    || (schema_name.eq_ignore_ascii_case("information_schema")
+                        && t_name.eq_ignore_ascii_case("tables"))
+                {
+                    let rows = CatalogManager::query_information_schema_tables(self.db)?;
+                    return Ok(format_table_output(&["table_catalog", "table_schema", "table_name", "table_type"], &rows));
+                }
+
+                if t_name.eq_ignore_ascii_case("information_schema.columns")
+                    || (schema_name.eq_ignore_ascii_case("information_schema")
+                        && t_name.eq_ignore_ascii_case("columns"))
+                {
+                    let rows = CatalogManager::query_information_schema_columns(self.db, None)?;
+                    return Ok(format_table_output(
+                        &["table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default"],
+                        &rows,
+                    ));
+                }
+
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
 
-                let header = col_names.join(" | ");
+                let mut rows = Vec::new();
 
-                let prefix = format!("{}:", table_name);
-                let mut records = self.db.scan_prefix(prefix.as_bytes())?;
-
-                if self.in_transaction {
-                    let prefix_bytes = prefix.as_bytes();
-                    for (k, v_opt) in &self.write_buffer {
-                        if k.starts_with(prefix_bytes) {
-                            records.retain(|(rk, _)| rk != k);
+                // Check index scan optimizations
+                let mut used_index = false;
+                if let Some((ref filter_col, ref filter_val)) = where_clause {
+                    let sec_key = format!("__secidx__:{}:{}:{}", t_name, filter_col, filter_val);
+                    if let Some(pks_bytes) = self.db.get(sec_key.as_bytes())? {
+                        used_index = true;
+                        let pks_str = String::from_utf8_lossy(&pks_bytes);
+                        let pks: Vec<&str> = pks_str.split(SEC_IDX_PK_SEP).collect();
+                        for pk in pks {
+                            let k = format!("{}:{}", t_name, pk).into_bytes();
+                            let v_opt = if self.in_transaction && self.write_buffer.contains_key(&k) {
+                                self.write_buffer.get(&k).cloned().flatten()
+                            } else {
+                                self.db.get(&k)?
+                            };
                             if let Some(v) = v_opt {
-                                records.push((k.clone(), v.clone()));
+                                rows.push(decode_values(&v)?);
                             }
                         }
                     }
                 }
 
-                let rows: Result<Vec<Vec<String>>> =
-                    records.iter().map(|(_, val)| decode_values(val)).collect();
-                let rows = rows?;
+                if !used_index {
+                    rows = self.scan_table_rows(&t_name)?;
+                }
 
                 let scan_op: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(rows));
 
-                let mut plan: Box<dyn ExecutionPlan> = if let Some((ref filter_col, ref filter_val)) =
-                    where_clause
-                {
-                    let col_idx = col_names.iter().position(|name| name == filter_col).ok_or_else(
-                        || anyhow::anyhow!("Column '{}' not found", filter_col),
-                    )?;
-                    Box::new(FilterExec::new(scan_op, col_idx, filter_val.clone()))
+                let filtered_op: Box<dyn ExecutionPlan> = if !used_index {
+                    if let Some((ref filter_col, ref filter_val)) = where_clause {
+                        let col_idx = col_names.iter().position(|name| name == filter_col).ok_or_else(
+                            || anyhow::anyhow!("Column '{}' not found", filter_col),
+                        )?;
+                        Box::new(FilterExec::new(scan_op, col_idx, filter_val.clone()))
+                    } else {
+                        scan_op
+                    }
                 } else {
                     scan_op
                 };
 
-                if let Some((ref sort_col, is_desc)) = order_by {
-                    let sort_col_idx = col_names.iter().position(|name| name == sort_col).ok_or_else(
-                        || anyhow::anyhow!("Column '{}' not found for ORDER BY", sort_col),
-                    )?;
-                    plan = Box::new(SortExec::new(plan, sort_col_idx, is_desc));
-                }
+                let sorted_op: Box<dyn ExecutionPlan> = if let Some((ref sort_col, is_desc)) = order_by {
+                    let col_idx = col_names
+                        .iter()
+                        .position(|name| name == sort_col)
+                        .ok_or_else(|| anyhow::anyhow!("Column '{}' not found for ORDER BY", sort_col))?;
+                    Box::new(SortExec::new(filtered_op, col_idx, is_desc))
+                } else {
+                    filtered_op
+                };
 
-                if let Some((limit, offset)) = limit_offset {
-                    plan = Box::new(LimitOffsetExec::new(plan, Some(limit), offset));
-                }
+                let mut plan: Box<dyn ExecutionPlan> = if let Some((limit, offset)) = limit_offset {
+                    Box::new(LimitOffsetExec::new(sorted_op, Some(limit), offset))
+                } else {
+                    sorted_op
+                };
 
                 plan.open()?;
 
+                let header = col_names.join(" | ");
                 let mut output =
                     format!("+-----------------+\n| {} |\n+-----------------+\n", header);
                 let mut count = 0;
@@ -323,18 +412,21 @@ impl<'a> Executor<'a> {
                 right_col,
                 is_left_join,
             } => {
-                let left_schema_bytes = self
-                    .get_schema_bytes(&left_table)?
+                let (_, l_tname) = parse_qualified_table_name(&left_table);
+                let (_, r_tname) = parse_qualified_table_name(&right_table);
+
+                let left_sb = self
+                    .get_schema_bytes(&l_tname)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", left_table))?;
-                let right_schema_bytes = self
-                    .get_schema_bytes(&right_table)?
+                let right_sb = self
+                    .get_schema_bytes(&r_tname)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", right_table))?;
 
-                let left_schema_val = String::from_utf8(left_schema_bytes)?;
-                let right_schema_val = String::from_utf8(right_schema_bytes)?;
+                let left_schema = String::from_utf8(left_sb)?;
+                let right_schema = String::from_utf8(right_sb)?;
 
-                let left_cols = Self::extract_col_names(&left_schema_val);
-                let right_cols = Self::extract_col_names(&right_schema_val);
+                let left_cols = Self::extract_col_names(&left_schema);
+                let right_cols = Self::extract_col_names(&right_schema);
 
                 let left_key_idx = left_cols
                     .iter()
@@ -343,53 +435,48 @@ impl<'a> Executor<'a> {
                 let right_key_idx = right_cols
                     .iter()
                     .position(|c| c == &right_col)
-                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in '{}'", right_col, right_table))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Column '{}' not found in '{}'", right_col, right_table)
+                    })?;
 
-                let left_prefix = format!("{}:", left_table);
-                let right_prefix = format!("{}:", right_table);
+                let l_rows = self.scan_table_rows(&l_tname)?;
+                let r_rows = self.scan_table_rows(&r_tname)?;
 
-                let left_records = self.db.scan_prefix(left_prefix.as_bytes())?;
-                let right_records = self.db.scan_prefix(right_prefix.as_bytes())?;
+                let left_plan: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(l_rows));
+                let right_plan: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(r_rows));
 
-                let left_rows: Result<Vec<Vec<String>>> =
-                    left_records.iter().map(|(_, v)| decode_values(v)).collect();
-                let right_rows: Result<Vec<Vec<String>>> =
-                    right_records.iter().map(|(_, v)| decode_values(v)).collect();
+                let join_type = if is_left_join {
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                };
 
-                let left_exec: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(left_rows?));
-                let right_exec: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(right_rows?));
-
-                let join_type = if is_left_join { JoinType::Left } else { JoinType::Inner };
-                let mut join_plan = HashJoinExec::new(
-                    left_exec,
-                    right_exec,
+                let mut plan = HashJoinExec::new(
+                    left_plan,
+                    right_plan,
                     left_key_idx,
                     right_key_idx,
                     join_type,
                     right_cols.len(),
                 );
 
-                join_plan.open()?;
+                plan.open()?;
 
-                let mut all_headers = Vec::new();
-                for c in &left_cols {
-                    all_headers.push(format!("{}.{}", left_table, c));
-                }
-                for c in &right_cols {
-                    all_headers.push(format!("{}.{}", right_table, c));
-                }
+                let mut combined_cols = left_cols;
+                combined_cols.extend(right_cols);
+                let header = combined_cols.join(" | ");
 
-                let header_str = all_headers.join(" | ");
                 let mut output =
-                    format!("+-----------------+\n| {} |\n+-----------------+\n", header_str);
+                    format!("+-----------------+\n| {} |\n+-----------------+\n", header);
                 let mut count = 0;
 
-                while let Some(joined_row) = join_plan.next()? {
-                    output.push_str(&format!("| {} |\n", joined_row.join(" | ")));
+                while let Some(row) = plan.next()? {
+                    let formatted_row = row.join(" | ");
+                    output.push_str(&format!("| {} |\n", formatted_row));
                     count += 1;
                 }
 
-                join_plan.close()?;
+                plan.close()?;
 
                 output.push_str("+-----------------+\n");
                 output.push_str(&format!("{} row(s) in set.", count));
@@ -404,8 +491,9 @@ impl<'a> Executor<'a> {
                 where_clause,
                 having_clause,
             } => {
+                let (_, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
@@ -413,14 +501,9 @@ impl<'a> Executor<'a> {
                 let group_col_idx = col_names
                     .iter()
                     .position(|c| c == &group_col)
-                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in '{}'", group_col, table_name))?;
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", group_col))?;
 
-                let prefix = format!("{}:", table_name);
-                let records = self.db.scan_prefix(prefix.as_bytes())?;
-                let rows: Result<Vec<Vec<String>>> =
-                    records.iter().map(|(_, val)| decode_values(val)).collect();
-                let rows = rows?;
-
+                let rows = self.scan_table_rows(&t_name)?;
                 let scan_op: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(rows));
 
                 let filtered_op: Box<dyn ExecutionPlan> =
@@ -436,40 +519,38 @@ impl<'a> Executor<'a> {
                 let agg_func = match func.as_str() {
                     "COUNT" => AggregateFunc::Count,
                     "SUM" => {
-                        let col_idx = col_names.iter().position(|name| name == &agg_col).ok_or_else(
-                            || anyhow::anyhow!("Column '{}' not found", agg_col),
-                        )?;
+                        let col_idx = col_names
+                            .iter()
+                            .position(|name| name == &agg_col)
+                            .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", agg_col))?;
                         AggregateFunc::Sum(col_idx)
                     }
                     "AVG" => {
-                        let col_idx = col_names.iter().position(|name| name == &agg_col).ok_or_else(
-                            || anyhow::anyhow!("Column '{}' not found", agg_col),
-                        )?;
+                        let col_idx = col_names
+                            .iter()
+                            .position(|name| name == &agg_col)
+                            .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", agg_col))?;
                         AggregateFunc::Avg(col_idx)
                     }
                     _ => return Err(anyhow::anyhow!("Unsupported aggregate function {}", func)),
                 };
 
-                let mut group_plan = HashGroupAggregateExec::new(
-                    filtered_op,
-                    group_col_idx,
-                    agg_func,
-                    having_clause,
-                );
-
-                group_plan.open()?;
+                let mut plan =
+                    HashGroupAggregateExec::new(filtered_op, group_col_idx, agg_func, having_clause);
+                plan.open()?;
 
                 let header = format!("{} | {}({})", group_col, func, agg_col);
                 let mut output =
                     format!("+-----------------+\n| {} |\n+-----------------+\n", header);
                 let mut count = 0;
 
-                while let Some(res_row) = group_plan.next()? {
-                    output.push_str(&format!("| {} |\n", res_row.join(" | ")));
+                while let Some(row) = plan.next()? {
+                    let formatted_row = row.join(" | ");
+                    output.push_str(&format!("| {} |\n", formatted_row));
                     count += 1;
                 }
 
-                group_plan.close()?;
+                plan.close()?;
 
                 output.push_str("+-----------------+\n");
                 output.push_str(&format!("{} row(s) in set.", count));
@@ -482,27 +563,25 @@ impl<'a> Executor<'a> {
                 op,
                 val,
             } => {
+                let (_, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
 
                 let col_idx = col_names
                     .iter()
-                    .position(|c| c == &column)
+                    .position(|name| name == &column)
                     .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", column))?;
 
+                let rows = self.scan_table_rows(&t_name)?;
                 let header = col_names.join(" | ");
-                let prefix = format!("{}:", table_name);
-                let records = self.db.scan_prefix(prefix.as_bytes())?;
-
                 let mut output =
                     format!("+-----------------+\n| {} |\n+-----------------+\n", header);
                 let mut count = 0;
 
-                for (_key, rval) in records {
-                    let decoded = decode_values(&rval)?;
+                for decoded in rows {
                     if col_idx < decoded.len() {
                         let row_v = &decoded[col_idx];
                         let num_row = row_v.parse::<f64>();
@@ -545,18 +624,14 @@ impl<'a> Executor<'a> {
                 table_name,
                 where_clause,
             } => {
+                let (_, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
 
-                let prefix = format!("{}:", table_name);
-                let records = self.db.scan_prefix(prefix.as_bytes())?;
-                let rows: Result<Vec<Vec<String>>> =
-                    records.iter().map(|(_, val)| decode_values(val)).collect();
-                let rows = rows?;
-
+                let rows = self.scan_table_rows(&t_name)?;
                 let scan_op: Box<dyn ExecutionPlan> = Box::new(SeqScanExec::new(rows));
 
                 let filtered_op: Box<dyn ExecutionPlan> =
@@ -606,8 +681,9 @@ impl<'a> Executor<'a> {
                 value,
                 pk_val,
             } => {
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
                 let schema_bytes = self
-                    .get_schema_bytes(&table_name)?
+                    .get_schema_bytes(&t_name)?
                     .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
                 let schema_val = String::from_utf8(schema_bytes)?;
                 let col_names = Self::extract_col_names(&schema_val);
@@ -623,7 +699,20 @@ impl<'a> Executor<'a> {
                         )
                     })?;
 
-                let internal_key = format!("{}:{}", table_name, pk_val).into_bytes();
+                // Validate updated type & constraints if schema exists
+                if let Some(schema) = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)? {
+                    if let Some(col_def) = schema.columns.get(col_idx) {
+                        let parsed_val = Value::parse_str(&value, &col_def.data_type)?;
+                        if !col_def.is_nullable && parsed_val.is_null() {
+                            return Err(anyhow::anyhow!(
+                                "Constraint Violation: Column '{}' cannot be NULL",
+                                col_def.name
+                            ));
+                        }
+                    }
+                }
+
+                let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
                 let existing_bytes = if self.in_transaction
                     && self.write_buffer.contains_key(&internal_key)
                 {
@@ -641,11 +730,11 @@ impl<'a> Executor<'a> {
                 }
 
                 let old_value = row_values[col_idx].clone();
-                self.sec_idx_remove_for_column(&table_name, &column, &old_value, &pk_val)?;
+                self.sec_idx_remove_for_column(&t_name, &column, &old_value, &pk_val)?;
 
                 row_values[col_idx] = value.clone();
 
-                self.sec_idx_add_for_column(&table_name, &column, &value, &pk_val)?;
+                self.sec_idx_add_for_column(&t_name, &column, &value, &pk_val)?;
 
                 let active_tx = if self.in_transaction { self.current_tx_id } else { 1 };
                 let updated_bytes = encode_values_mvcc(&row_values, active_tx, 0);
@@ -659,7 +748,8 @@ impl<'a> Executor<'a> {
                 Ok("Query OK, 1 row updated.".to_string())
             }
             Statement::Delete { table_name, pk_val } => {
-                let internal_key = format!("{}:{}", table_name, pk_val).into_bytes();
+                let (_, t_name) = parse_qualified_table_name(&table_name);
+                let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
 
                 let existing_bytes = if self.in_transaction
                     && self.write_buffer.contains_key(&internal_key)
@@ -670,12 +760,12 @@ impl<'a> Executor<'a> {
                 };
 
                 if let Some(row_data) = existing_bytes {
-                    if let Ok(Some(sb)) = self.get_schema_bytes(&table_name) {
+                    if let Ok(Some(sb)) = self.get_schema_bytes(&t_name) {
                         if let Ok(schema_val) = String::from_utf8(sb) {
                             let col_names = Self::extract_col_names(&schema_val);
                             if let Ok(decoded) = decode_values(&row_data) {
                                 self.remove_all_secondary_indexes(
-                                    &table_name, &col_names, &decoded, &pk_val,
+                                    &t_name, &col_names, &decoded, &pk_val,
                                 )?;
                             }
                         }
@@ -691,25 +781,30 @@ impl<'a> Executor<'a> {
                 Ok("Query OK, 1 row deleted.".to_string())
             }
             Statement::DropTable { table_name } => {
-                let schema_key = format!("__schema__:{}", table_name);
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
+                let schema_key = format!("__schema__:{}", t_name);
 
-                if self.get_schema_bytes(&table_name)?.is_none() {
+                if self.get_schema_bytes(&t_name)?.is_none() {
                     return Err(anyhow::anyhow!("Table '{}' does not exist", table_name));
                 }
 
-                let prefix = format!("{}:", table_name);
+                let prefix = format!("{}:", t_name);
                 let records = self.db.scan_prefix(prefix.as_bytes())?;
 
-                let idx_prefix = format!("__index__:{}:", table_name);
+                let idx_prefix = format!("__index__:{}:", t_name);
                 let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
                 for (idx_key, _) in &indices {
                     self.db.delete(idx_key)?;
                 }
-                let sec_prefix = format!("__secidx__:{}:", table_name);
+                let sec_prefix = format!("__secidx__:{}:", t_name);
                 let sec_entries = self.db.scan_prefix(sec_prefix.as_bytes())?;
                 for (sec_key, _) in sec_entries {
                     self.db.delete(&sec_key)?;
                 }
+
+                // Delete catalog entry
+                let catalog_key = CatalogManager::table_key(&schema_name, &t_name);
+                self.db.delete(catalog_key.as_bytes())?;
 
                 if self.in_transaction {
                     self.write_buffer.insert(schema_key.into_bytes(), None);
@@ -726,16 +821,7 @@ impl<'a> Executor<'a> {
                 Ok(format!("Query OK, table '{}' dropped.", table_name))
             }
             Statement::ShowTables => {
-                let prefix = b"__schema__:";
-                let records = self.db.scan_prefix(prefix)?;
-
-                let mut tables = Vec::new();
-                for (key, _) in records {
-                    let k_str = String::from_utf8_lossy(&key);
-                    if let Some(tname) = k_str.strip_prefix("__schema__:") {
-                        tables.push(tname.to_string());
-                    }
-                }
+                let tables = CatalogManager::list_tables(self.db, DEFAULT_SCHEMA)?;
 
                 let mut output =
                     "+-----------------+\n| Tables |\n+-----------------+\n".to_string();
@@ -751,6 +837,38 @@ impl<'a> Executor<'a> {
     }
 
     // ---- Helper methods ----
+
+    fn scan_table_rows(&mut self, table_name: &str) -> Result<Vec<Vec<String>>> {
+        let prefix = format!("{}:", table_name);
+        let records = self.db.scan_prefix(prefix.as_bytes())?;
+
+        let mut row_map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for (k, v) in records {
+            row_map.insert(k, v);
+        }
+
+        if self.in_transaction {
+            let p_bytes = prefix.as_bytes();
+            for (k, v_opt) in &self.write_buffer {
+                if k.starts_with(p_bytes) {
+                    match v_opt {
+                        Some(v) => {
+                            row_map.insert(k.clone(), v.clone());
+                        }
+                        None => {
+                            row_map.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        for (_k, v) in row_map {
+            rows.push(decode_values(&v)?);
+        }
+        Ok(rows)
+    }
 
     fn get_schema_bytes(&mut self, table_name: &str) -> Result<Option<Vec<u8>>> {
         let schema_key = format!("__schema__:{}", table_name);
@@ -927,6 +1045,56 @@ impl<'a> Executor<'a> {
         }
         Ok(())
     }
+}
+
+fn parse_column_def(raw: &str) -> ColumnDef {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let col_name = tokens.first().cloned().unwrap_or("col").to_string();
+
+    let mut dtype = DataType::Text;
+    let mut is_nullable = true;
+    let mut is_pk = false;
+
+    let upper_raw = raw.to_uppercase();
+    if upper_raw.contains("PRIMARY KEY") {
+        is_pk = true;
+        is_nullable = false;
+    }
+    if upper_raw.contains("NOT NULL") {
+        is_nullable = false;
+    }
+
+    if tokens.len() > 1 {
+        let type_str = tokens[1].trim_matches(|c| c == ',' || c == '(' || c == ')');
+        if let Ok(dt) = DataType::from_str(type_str) {
+            dtype = dt;
+        }
+    }
+
+    ColumnDef::new(col_name, dtype)
+        .with_nullable(is_nullable)
+        .with_primary_key(is_pk)
+}
+
+fn parse_qualified_table_name(raw: &str) -> (String, String) {
+    if let Some(dot_idx) = raw.find('.') {
+        let s_name = raw[..dot_idx].trim().to_string();
+        let t_name = raw[dot_idx + 1..].trim().to_string();
+        (s_name, t_name)
+    } else {
+        (DEFAULT_SCHEMA.to_string(), raw.trim().to_string())
+    }
+}
+
+fn format_table_output(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let header_str = headers.join(" | ");
+    let mut output = format!("+-----------------+\n| {} |\n+-----------------+\n", header_str);
+    for row in rows {
+        output.push_str(&format!("| {} |\n", row.join(" | ")));
+    }
+    output.push_str("+-----------------+\n");
+    output.push_str(&format!("{} row(s) in set.", rows.len()));
+    output
 }
 
 #[cfg(test)]

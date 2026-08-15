@@ -5,6 +5,9 @@ const RESERVED_PREFIX: &str = "__";
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
+    CreateSchema {
+        schema_name: String,
+    },
     CreateTable {
         table_name: String,
         columns: Vec<String>,
@@ -65,6 +68,7 @@ pub enum Statement {
         table_name: String,
     },
     ShowTables,
+    ShowSchemas,
     Begin,
     Commit,
     Rollback,
@@ -77,7 +81,9 @@ impl Parser {
         let sql = sql.trim().trim_end_matches(';');
         let upper_sql = sql.to_uppercase();
 
-        if upper_sql.starts_with("CREATE INDEX") {
+        if upper_sql.starts_with("CREATE SCHEMA") {
+            Self::parse_create_schema(sql)
+        } else if upper_sql.starts_with("CREATE INDEX") {
             Self::parse_create_index(sql)
         } else if upper_sql.starts_with("CREATE TABLE") {
             Self::parse_create_table(sql)
@@ -93,6 +99,8 @@ impl Parser {
             Self::parse_drop_table(sql)
         } else if upper_sql == "SHOW TABLES" {
             Ok(Statement::ShowTables)
+        } else if upper_sql == "SHOW SCHEMAS" {
+            Ok(Statement::ShowSchemas)
         } else if upper_sql == "BEGIN" {
             Ok(Statement::Begin)
         } else if upper_sql == "COMMIT" {
@@ -106,16 +114,23 @@ impl Parser {
 
     /// Validates that an identifier (table/column name) doesn't use reserved prefixes.
     fn validate_identifier(name: &str) -> Result<()> {
-        if name.starts_with(RESERVED_PREFIX) {
+        let clean = name.trim();
+        if clean.starts_with(RESERVED_PREFIX) {
             return Err(anyhow!(
                 "Identifier '{}' uses reserved prefix '{}'. Choose a different name.",
-                name, RESERVED_PREFIX
+                clean, RESERVED_PREFIX
             ));
         }
-        if name.is_empty() {
+        if clean.is_empty() {
             return Err(anyhow!("Identifier cannot be empty"));
         }
         Ok(())
+    }
+
+    fn parse_create_schema(sql: &str) -> Result<Statement> {
+        let schema_name = sql[13..].trim().to_string();
+        Self::validate_identifier(&schema_name)?;
+        Ok(Statement::CreateSchema { schema_name })
     }
 
     fn parse_create_table(sql: &str) -> Result<Statement> {
@@ -547,6 +562,17 @@ mod tests {
                 where_clause: None,
                 order_by: Some(("age".to_string(), true)),
                 limit_offset: Some((10, 5)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_create_schema() {
+        let stmt = Parser::parse("CREATE SCHEMA analytics").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateSchema {
+                schema_name: "analytics".to_string(),
             }
         );
     }

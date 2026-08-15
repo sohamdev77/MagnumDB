@@ -12,10 +12,12 @@ use btree::BTree;
 use buffer_pool::BufferPool;
 use pager::Pager;
 
+use parking_lot::Mutex;
+
 /// The core Database structure.
 pub struct Database {
     config: Config,
-    wal: Option<WriteAheadLog>,
+    wal: Option<Mutex<WriteAheadLog>>,
     index: BTree,
 }
 
@@ -39,14 +41,15 @@ impl Database {
             .with_sync_interval(config.storage.sync_interval);
         let mut index = BTree::new(buffer_pool)?;
 
-        let mut wal = if config.wal.enabled {
-            Some(WriteAheadLog::open(&config.storage.path)?)
+        let wal = if config.wal.enabled {
+            Some(Mutex::new(WriteAheadLog::open(&config.storage.path)?))
         } else {
             None
         };
 
         // Perform WAL Recovery if enabled — only replay entries after the checkpoint LSN
-        if let Some(wal_ref) = &mut wal {
+        if let Some(wal_mutex) = &wal {
+            let mut wal_ref = wal_mutex.lock();
             let entries = wal_ref.recover(checkpoint_lsn)?;
             for entry in entries {
                 match entry {
@@ -59,7 +62,7 @@ impl Database {
                 }
             }
             // After recovery, flush and sync to make recovered data durable
-            if !entries_is_empty_hint(wal_ref) {
+            if !entries_is_empty_hint(&*wal_ref) {
                 index.flush_and_sync()?;
             }
         }
@@ -68,13 +71,14 @@ impl Database {
     }
 
     /// Inserts a key-value pair into the database (non-transactional, tx_id=0).
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.put_with_tx(0, key, value)
     }
 
     /// Inserts a key-value pair with an explicit transaction ID.
-    pub fn put_with_tx(&mut self, tx_id: u64, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-        if let Some(wal) = &mut self.wal {
+    pub fn put_with_tx(&self, tx_id: u64, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             wal.append_tx_put(tx_id, key, value)?;
             if self.config.wal.sync_on_write {
                 wal.sync()?;
@@ -86,28 +90,29 @@ impl Database {
     }
 
     /// Retrieves a value by key. Returns None if the key doesn't exist.
-    pub fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         self.index.search(key)
     }
 
     /// Scans all key-value pairs in the database.
-    pub fn scan(&mut self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.index.scan()
     }
 
     /// Scans key-value pairs matching a prefix efficiently.
-    pub fn scan_prefix(&mut self, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.index.scan_prefix(prefix)
     }
 
     /// Deletes a key from the database (non-transactional, tx_id=0).
-    pub fn delete(&mut self, key: &[u8]) -> anyhow::Result<()> {
+    pub fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
         self.delete_with_tx(0, key)
     }
 
     /// Deletes a key with an explicit transaction ID.
-    pub fn delete_with_tx(&mut self, tx_id: u64, key: &[u8]) -> anyhow::Result<()> {
-        if let Some(wal) = &mut self.wal {
+    pub fn delete_with_tx(&self, tx_id: u64, key: &[u8]) -> anyhow::Result<()> {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             wal.append_tx_delete(tx_id, key)?;
             if self.config.wal.sync_on_write {
                 wal.sync()?;
@@ -119,8 +124,9 @@ impl Database {
     }
 
     /// Logs BEGIN transaction to WAL.
-    pub fn begin_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
-        if let Some(wal) = &mut self.wal {
+    pub fn begin_tx(&self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             wal.append_begin(tx_id)?;
             if self.config.wal.sync_on_write {
                 wal.sync()?;
@@ -130,8 +136,9 @@ impl Database {
     }
 
     /// Logs COMMIT transaction to WAL and flushes+syncs the buffer pool.
-    pub fn commit_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
-        if let Some(wal) = &mut self.wal {
+    pub fn commit_tx(&self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             wal.append_commit(tx_id)?;
             // Always sync the WAL on commit for durability
             wal.sync()?;
@@ -143,8 +150,9 @@ impl Database {
     }
 
     /// Logs ROLLBACK transaction to WAL.
-    pub fn rollback_tx(&mut self, tx_id: u64) -> anyhow::Result<()> {
-        if let Some(wal) = &mut self.wal {
+    pub fn rollback_tx(&self, tx_id: u64) -> anyhow::Result<()> {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             wal.append_rollback(tx_id)?;
             if self.config.wal.sync_on_write {
                 wal.sync()?;
@@ -158,12 +166,12 @@ impl Database {
         self.index.flush_all()?;
         self.index.sync()?;
 
-        if let Some(wal) = &mut self.wal {
+        if let Some(wal_mutex) = &self.wal {
+            let mut wal = wal_mutex.lock();
             let current_lsn = wal.current_lsn();
             // Write checkpoint LSN to page 0 before truncating the WAL
             self.index
-                .buffer_pool_mut()
-                .pager_mut()
+                .buffer_pool()
                 .write_checkpoint_lsn(current_lsn)?;
             self.index.sync()?;
             wal.checkpoint()?;

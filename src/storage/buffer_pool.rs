@@ -1,15 +1,20 @@
 use super::pager::{Page, PageId, Pager};
 use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+pub type PageRef = Arc<RwLock<Page>>;
 
 /// The Buffer Pool Manager is responsible for fetching pages from the Pager,
 /// caching them in memory, and evicting the least recently used pages back to disk.
+#[derive(Clone)]
 pub struct BufferPool {
-    pager: Pager,
-    /// Caches PageId -> (Page, is_dirty)
-    cache: LruCache<PageId, (Page, bool)>,
+    pager: Arc<Mutex<Pager>>,
+    /// Caches PageId -> (PageRef, is_dirty)
+    cache: Arc<Mutex<LruCache<PageId, (PageRef, bool)>>>,
     /// Counter for auto-sync after N dirty writes
-    dirty_write_count: u32,
+    dirty_write_count: Arc<Mutex<u32>>,
     /// Sync every N dirty writes. 0 = disabled.
     sync_interval: u32,
 }
@@ -19,9 +24,9 @@ impl BufferPool {
     pub fn new(pager: Pager, capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
-            pager,
-            cache: LruCache::new(cap),
-            dirty_write_count: 0,
+            pager: Arc::new(Mutex::new(pager)),
+            cache: Arc::new(Mutex::new(LruCache::new(cap))),
+            dirty_write_count: Arc::new(Mutex::new(0)),
             sync_interval: 0,
         }
     }
@@ -33,28 +38,74 @@ impl BufferPool {
     }
 
     /// Fetches a page from the buffer pool or reads it from disk if not present.
-    pub fn fetch_page(&mut self, page_id: PageId) -> anyhow::Result<Page> {
-        if let Some((page, _)) = self.cache.get(&page_id) {
-            return Ok(page.clone());
+    pub fn fetch_page(&self, page_id: PageId) -> anyhow::Result<PageRef> {
+        {
+            let mut cache = self.cache.lock();
+            if let Some((page_ref, _)) = cache.get(&page_id) {
+                return Ok(Arc::clone(page_ref));
+            }
         }
 
-        let page = self.pager.read_page(page_id)?;
+        let page = {
+            let mut pager = self.pager.lock();
+            pager.read_page(page_id)?
+        };
 
-        self.put_and_evict(page_id, page.clone(), false)?;
+        let page_ref = Arc::new(RwLock::new(page));
+        self.put_and_evict(page_id, Arc::clone(&page_ref), false)?;
 
-        Ok(page)
+        Ok(page_ref)
     }
 
     /// Writes a page to the buffer pool, marking it as dirty.
-    pub fn write_page(&mut self, page_id: PageId, page: &Page) -> anyhow::Result<()> {
-        self.put_and_evict(page_id, page.clone(), true)?;
+    pub fn write_page(&self, page_id: PageId, page: &Page) -> anyhow::Result<()> {
+        let page_ref = {
+            let mut cache = self.cache.lock();
+            if let Some((page_ref, _)) = cache.get(&page_id) {
+                Some(Arc::clone(page_ref))
+            } else {
+                None
+            }
+        };
 
-        // Auto-sync after N dirty writes
+        if let Some(page_ref) = page_ref {
+            {
+                let mut guard = page_ref.write();
+                *guard = page.clone();
+            }
+            self.mark_dirty(page_id)?;
+        } else {
+            let page_ref = Arc::new(RwLock::new(page.clone()));
+            self.put_and_evict(page_id, Arc::clone(&page_ref), true)?;
+            
+            if self.sync_interval > 0 {
+                let mut dwc = self.dirty_write_count.lock();
+                *dwc += 1;
+                if *dwc >= self.sync_interval {
+                    *dwc = 0;
+                    self.flush_and_sync()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Marks a page as dirty in the buffer pool cache.
+    pub fn mark_dirty(&self, page_id: PageId) -> anyhow::Result<()> {
+        {
+            let mut cache = self.cache.lock();
+            if let Some((_, dirty)) = cache.get_mut(&page_id) {
+                *dirty = true;
+            }
+        }
+
         if self.sync_interval > 0 {
-            self.dirty_write_count += 1;
-            if self.dirty_write_count >= self.sync_interval {
+            let mut dwc = self.dirty_write_count.lock();
+            *dwc += 1;
+            if *dwc >= self.sync_interval {
+                *dwc = 0;
                 self.flush_and_sync()?;
-                self.dirty_write_count = 0;
             }
         }
 
@@ -62,84 +113,94 @@ impl BufferPool {
     }
 
     /// Allocates a new page on disk and returns its ID.
-    pub fn allocate_page(&mut self) -> anyhow::Result<PageId> {
-        let page_id = self.pager.allocate_page()?;
+    pub fn allocate_page(&self) -> anyhow::Result<PageId> {
+        let mut pager = self.pager.lock();
+        let page_id = pager.allocate_page()?;
         Ok(page_id)
     }
 
     /// Frees a page on disk and removes it from the cache.
-    pub fn free_page(&mut self, page_id: PageId) -> anyhow::Result<()> {
-        self.cache.pop(&page_id);
-        self.pager.free_page(page_id)?;
+    pub fn free_page(&self, page_id: PageId) -> anyhow::Result<()> {
+        {
+            let mut cache = self.cache.lock();
+            cache.pop(&page_id);
+        }
+        let mut pager = self.pager.lock();
+        pager.free_page(page_id)?;
         Ok(())
     }
 
     /// Helper function to put a page in the cache and evict the oldest if full.
-    fn put_and_evict(&mut self, page_id: PageId, page: Page, is_dirty: bool) -> anyhow::Result<()> {
-        if self.cache.len() == self.cache.cap().get() {
-            // Need to evict if we are inserting a new page (not updating an existing one)
-            if !self.cache.contains(&page_id) {
-                if let Some((evict_id, (evict_page, evict_dirty))) = self.cache.pop_lru() {
-                    if evict_dirty {
-                        self.pager.write_page(evict_id, &evict_page)?;
-                    }
+    fn put_and_evict(&self, page_id: PageId, page_ref: PageRef, is_dirty: bool) -> anyhow::Result<()> {
+        let mut cache = self.cache.lock();
+        if cache.len() == cache.cap().get() && !cache.contains(&page_id) {
+            if let Some((evict_id, (evict_ref, evict_dirty))) = cache.pop_lru() {
+                if evict_dirty {
+                    let mut pager = self.pager.lock();
+                    let page_guard = evict_ref.read();
+                    pager.write_page(evict_id, &*page_guard)?;
                 }
             }
         }
 
-        // If we already have it, we just update it. `put` updates the value and moves to MRU.
-        if let Some((_, curr_dirty)) = self.cache.get(&page_id) {
-            // Keep it dirty if it was already dirty
+        if let Some((_, curr_dirty)) = cache.get(&page_id) {
             let new_dirty = is_dirty || *curr_dirty;
-            self.cache.put(page_id, (page, new_dirty));
+            cache.put(page_id, (page_ref, new_dirty));
         } else {
-            self.cache.put(page_id, (page, is_dirty));
+            cache.put(page_id, (page_ref, is_dirty));
         }
 
         Ok(())
     }
 
     /// Flushes all dirty pages back to disk.
-    pub fn flush_all(&mut self) -> anyhow::Result<()> {
+    pub fn flush_all(&self) -> anyhow::Result<()> {
         let mut to_flush = Vec::new();
-        for (page_id, (page, dirty)) in self.cache.iter() {
-            if *dirty {
-                to_flush.push((*page_id, page.clone()));
+        {
+            let mut cache = self.cache.lock();
+            for (page_id, (page_ref, dirty)) in cache.iter_mut() {
+                if *dirty {
+                    to_flush.push((*page_id, Arc::clone(page_ref)));
+                    *dirty = false;
+                }
             }
         }
 
-        for (page_id, page) in to_flush {
-            self.pager.write_page(page_id, &page)?;
-            if let Some(entry) = self.cache.get_mut(&page_id) {
-                entry.1 = false;
-            }
+        let mut pager = self.pager.lock();
+        for (page_id, page_ref) in to_flush {
+            let guard = page_ref.read();
+            pager.write_page(page_id, &*guard)?;
         }
 
         Ok(())
     }
 
     /// Flushes all dirty pages and fsyncs the data file to disk.
-    /// This guarantees all buffered writes are durable.
-    pub fn flush_and_sync(&mut self) -> anyhow::Result<()> {
+    pub fn flush_and_sync(&self) -> anyhow::Result<()> {
         self.flush_all()?;
-        self.pager.sync()?;
+        let mut pager = self.pager.lock();
+        pager.sync()?;
         Ok(())
     }
 
     /// Syncs the pager to disk.
-    pub fn sync(&mut self) -> anyhow::Result<()> {
-        self.pager.sync()?;
+    pub fn sync(&self) -> anyhow::Result<()> {
+        let mut pager = self.pager.lock();
+        pager.sync()?;
         Ok(())
     }
 
     /// Returns the total number of allocated pages on disk.
     pub fn get_num_pages(&self) -> u32 {
-        self.pager.num_pages
+        let pager = self.pager.lock();
+        pager.num_pages
     }
 
-    /// Returns a mutable reference to the underlying pager (for checkpoint LSN access).
-    pub fn pager_mut(&mut self) -> &mut Pager {
-        &mut self.pager
+    /// Safely writes the checkpoint LSN to disk
+    pub fn write_checkpoint_lsn(&self, lsn: u64) -> anyhow::Result<()> {
+        let mut pager = self.pager.lock();
+        pager.write_checkpoint_lsn(lsn)?;
+        Ok(())
     }
 }
 
@@ -154,33 +215,30 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         let pager = Pager::open(&path)?;
-        // Create pool with capacity of exactly 2 pages
-        let mut pool = BufferPool::new(pager, 2);
+        let pool = BufferPool::new(pager, 2);
 
-        // Allocate 3 pages
         let id0 = pool.allocate_page()?;
         let id1 = pool.allocate_page()?;
         let id2 = pool.allocate_page()?;
 
-        // Write page 0
-        let mut page0 = Page::default();
-        page0.data[0] = 100;
-        pool.write_page(id0, &page0)?;
+        {
+            let p0 = pool.fetch_page(id0)?;
+            p0.write().data[0] = 100;
+            pool.mark_dirty(id0)?;
+        }
 
-        // Write page 1
-        let mut page1 = Page::default();
-        page1.data[0] = 101;
-        pool.write_page(id1, &page1)?;
+        {
+            let p1 = pool.fetch_page(id1)?;
+            p1.write().data[0] = 101;
+            pool.mark_dirty(id1)?;
+        }
 
-        // At this point, cache has id0 and id1.
-        // Write page 2 -> this should evict id0 because it's the LRU
-        let mut page2 = Page::default();
-        page2.data[0] = 102;
-        pool.write_page(id2, &page2)?;
+        {
+            let p2 = pool.fetch_page(id2)?;
+            p2.write().data[0] = 102;
+            pool.mark_dirty(id2)?;
+        }
 
-        // Now cache has id1 and id2. id0 was evicted and written to disk.
-
-        // Let's create a new pager directly to read from disk and verify id0 was written
         let mut direct_pager = Pager::open(&path)?;
         let read_page0 = direct_pager.read_page(id0)?;
         assert_eq!(read_page0.data[0], 100);
@@ -194,17 +252,17 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         let pager = Pager::open(&path)?;
-        let mut pool = BufferPool::new(pager, 10);
+        let pool = BufferPool::new(pager, 10);
 
         let id = pool.allocate_page()?;
-        let mut page = Page::default();
-        page.data[0] = 77;
-        pool.write_page(id, &page)?;
+        {
+            let p = pool.fetch_page(id)?;
+            p.write().data[0] = 77;
+            pool.mark_dirty(id)?;
+        }
 
-        // Flush and sync
         pool.flush_and_sync()?;
 
-        // Verify on disk
         let mut direct_pager = Pager::open(&path)?;
         let read_page = direct_pager.read_page(id)?;
         assert_eq!(read_page.data[0], 77);
