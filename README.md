@@ -18,25 +18,24 @@ MagnumDB is an open-source embedded key-value and SQL database engine written 10
 - **WAL Durability**: Write-Ahead Logging (WAL) with TxID framing and CRC32 checksums ensures crash recovery.
 - **B+ Tree Indexing**: Custom 4KB page disk pager, LRU buffer pool management, overflow pages, and leaf page recycling.
 - **Relational SQL Query Engine**: Hash JOINs (`INNER JOIN`, `LEFT JOIN`), `GROUP BY` & `HAVING` aggregations, `ORDER BY` sorting, `LIMIT` & `OFFSET` pagination, and composite indexes.
-- **MVCC & Transactions**: MVCC row headers (`xmin`, `xmax`) and transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK`.
+- **MVCC & Transactions**: Thread-safe MVCC row headers (`xmin`, `xmax`) and transaction logging with `BEGIN`, `COMMIT`, and `ROLLBACK`.
+- **Authentication & RBAC**: PostgreSQL-compatible MD5 authentication and `CREATE USER` role-based access control.
 - **PostgreSQL Protocol & Extended Querying**: Native PostgreSQL Wire Protocol (`pgwire`) supporting prepared statements and `$1`, `$2` parameter binding (`Parse`, `Bind`, `Execute`).
 - **Multi-Client TCP Server**: Async TCP server powered by Tokio with connection limits and idle timeouts.
 
 ---
 
-## What's New in v0.4.0
+## What's New in v0.4.2
 
-Version `0.4.0` expands SQL ordering, pagination, and ORM parameter binding:
+Version `0.4.2` introduces Authentication, Role-Based Access Control (RBAC), and thread-safe MVCC concurrency:
 
-- ↕️ **`ORDER BY` Sorting (`SortExec`)**: Sort query results by numeric or text columns in ascending or descending order:
+- 🔒 **Authentication Handshake**: PostgreSQL-compatible MD5 password authentication over `pgwire`.
+- 👤 **`CREATE USER` DDL**: Provision users and manage roles directly via SQL:
   ```sql
-  SELECT * FROM users ORDER BY age DESC;
+  CREATE USER admin WITH PASSWORD 'secure_pass';
   ```
-- 📄 **`LIMIT` & `OFFSET` Pagination (`LimitOffsetExec`)**: Skip offset rows and cap max result rows:
-  ```sql
-  SELECT * FROM users ORDER BY age DESC LIMIT 10 OFFSET 5;
-  ```
-- 📝 **Extended PostgreSQL Protocol ($1 Parameter Binding)**: Server handles prepared statements (`Parse` 'P', `Bind` 'B', `Execute` 'E') with `$1, $2` parameter substitution for ORMs.
+- 🧵 **Thread-Safe MVCC**: Safe, concurrent transaction execution using `parking_lot::RwLock` for multi-client scale.
+- ↕️ **`ORDER BY`, `LIMIT`, `OFFSET`**: Sort and paginate query results.
 
 ---
 
@@ -68,7 +67,7 @@ Add MagnumDB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-magnumdb = "0.4.0"
+magnumdb = "0.4.2"
 ```
 
 ---
