@@ -169,7 +169,7 @@ impl<'a> Executor<'a> {
                 }
 
                 let col_defs: Vec<ColumnDef> = columns.iter().map(|c| parse_column_def(c)).collect();
-                let table_schema = TableSchema::new(schema_name.clone(), t_name.clone(), col_defs);
+                let table_schema = TableSchema::new(schema_name.clone(), t_name.clone(), col_defs.clone());
                 CatalogManager::save_table_schema(self.db, &table_schema)?;
 
                 let schema_val = columns.join(",");
@@ -178,6 +178,19 @@ impl<'a> Executor<'a> {
                         .insert(schema_key.into_bytes(), Some(schema_val.into_bytes()));
                 } else {
                     self.db.put(schema_key.as_bytes(), schema_val.as_bytes())?;
+                }
+                
+                // Create implicit secondary indexes for UNIQUE constraints
+                for col in &col_defs {
+                    if col.is_unique {
+                        let idx_meta_key = format!("__index__:{}:idx_{}_{}", t_name, t_name, col.name);
+                        let schema_val = format!("{}", col.name);
+                        if self.in_transaction {
+                            self.write_buffer.insert(idx_meta_key.into_bytes(), Some(schema_val.into_bytes()));
+                        } else {
+                            self.db.put(idx_meta_key.as_bytes(), schema_val.as_bytes())?;
+                        }
+                    }
                 }
 
                 let msg = if schema_name == DEFAULT_SCHEMA {
@@ -231,7 +244,7 @@ impl<'a> Executor<'a> {
                         let composite_val = col_vals.join("+");
                         let pk = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                         let column_key = columns.join("+");
-                        self.sec_idx_add(&t_name, &column_key, &composite_val, &pk)?;
+                        self.sec_idx_add(&t_name, &column_key, &composite_val, &pk, false)?;
                     }
                 }
 
@@ -256,18 +269,26 @@ impl<'a> Executor<'a> {
                 let mut inserted_count = 0;
 
                 for values in values_list {
+                    let mut padded_values = values.clone();
                     if let Some(schema) = &catalog_schema {
-                        if values.len() != schema.columns.len() {
+                        if padded_values.len() < schema.columns.len() {
+                            for col in schema.columns.iter().skip(padded_values.len()) {
+                                let def_val = col.default_value.clone().unwrap_or_else(|| "NULL".to_string());
+                                padded_values.push(def_val);
+                            }
+                        }
+                        
+                        if padded_values.len() != schema.columns.len() {
                             return Err(anyhow::anyhow!(
                                 "Column count mismatch: expected {}, got {}",
                                 schema.columns.len(),
-                                values.len()
+                                padded_values.len()
                             ));
                         }
 
                         // Validate typed values & NOT NULL constraints
                         for (i, col) in schema.columns.iter().enumerate() {
-                            let val_str = &values[i];
+                            let val_str = &padded_values[i];
                             let parsed_val = Value::parse_str(val_str, &col.data_type)?;
                             if !col.is_nullable && parsed_val.is_null() {
                                 return Err(anyhow::anyhow!(
@@ -284,13 +305,29 @@ impl<'a> Executor<'a> {
                         ));
                     }
 
-                    if values.is_empty() {
+                    if padded_values.is_empty() {
                         return Err(anyhow::anyhow!("No values provided for insertion"));
                     }
 
-                    let pk = &values[0];
+                    let pk = &padded_values[0];
                     let internal_key = format!("{}:{}", t_name, pk).into_bytes();
-                    let internal_val = encode_values_mvcc(&values, active_tx, 0);
+                    
+                    // Check if primary key already exists
+                    let mut exists = false;
+                    if self.in_transaction {
+                        if let Some(val_opt) = self.write_buffer.get(&internal_key) {
+                            exists = val_opt.is_some();
+                        } else {
+                            exists = self.db.get(&internal_key)?.is_some();
+                        }
+                    } else {
+                        exists = self.db.get(&internal_key)?.is_some();
+                    }
+                    
+                    if exists {
+                        return Err(anyhow::anyhow!("UNIQUE constraint violation: Primary key '{}' already exists", pk));
+                    }
+                    let internal_val = encode_values_mvcc(&padded_values, active_tx, 0);
 
                     if self.in_transaction {
                         self.write_buffer.insert(internal_key, Some(internal_val));
@@ -298,7 +335,7 @@ impl<'a> Executor<'a> {
                         self.db.put(&internal_key, &internal_val)?;
                     }
 
-                    self.sync_secondary_indexes_on_insert(&t_name, &col_names, &values, pk)?;
+                    self.sync_secondary_indexes_on_insert(&t_name, &col_names, &padded_values, pk, catalog_schema.as_ref())?;
                     inserted_count += 1;
                 }
 
@@ -307,6 +344,146 @@ impl<'a> Executor<'a> {
                 } else {
                     Ok(format!("Query OK, {} rows inserted.", inserted_count))
                 }
+            }
+            Statement::With { cte_name, cte_query, main_query } => {
+                let cte_res = self.execute(*cte_query)?;
+                let (header, rows) = parse_formatted_table(&cte_res);
+                
+                // create temp table
+                let create_stmt = Statement::CreateTable { table_name: cte_name.clone(), columns: header.trim_matches('|').split('|').map(|s| format!("{} TEXT", s.trim())).collect() };
+                self.execute(create_stmt)?;
+                
+                // insert rows
+                for row_str in rows {
+                    let vals: Vec<String> = row_str.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                    self.execute(Statement::Insert { table_name: cte_name.clone(), values_list: vec![vals] })?;
+                }
+                
+                // execute main query
+                let main_res = self.execute(*main_query)?;
+                
+                // drop temp table
+                self.execute(Statement::DropTable { table_name: cte_name })?;
+                
+                Ok(main_res)
+            }
+            Statement::Union { left, right, all } => {
+                let left_res = self.execute(*left)?;
+                let right_res = self.execute(*right)?;
+                
+                let (header1, mut rows1) = parse_formatted_table(&left_res);
+                let (_, rows2) = parse_formatted_table(&right_res);
+                
+                rows1.extend(rows2);
+                
+                if !all {
+                    let mut unique = std::collections::HashSet::new();
+                    rows1.retain(|x| unique.insert(x.clone()));
+                }
+                
+                let mut output = format!("+-----------------+\n{}\n+-----------------+\n", header1);
+                for row in &rows1 {
+                    output.push_str(&format!("{}\n", row));
+                }
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", rows1.len()));
+                
+                Ok(output)
+            }
+            Statement::SelectInSubquery { table_name, column, subquery } => {
+                let sub_res = self.execute(*subquery)?;
+                let (_, sub_rows) = parse_formatted_table(&sub_res);
+                
+                let mut allowed_values = std::collections::HashSet::new();
+                for row_str in sub_rows {
+                    let vals: Vec<String> = row_str.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                    if let Some(val) = vals.first() {
+                        allowed_values.insert(val.clone());
+                    }
+                }
+                
+                // Now execute the main query as a normal select, but filter by allowed_values
+                // Wait, we can't easily push the HashSet into the Volcano engine without modifying it.
+                // Alternatively, we can just execute `SELECT * FROM table` and filter it here!
+                let main_res = self.execute(Statement::Select { table_name, where_clause: None, order_by: None, limit_offset: None })?;
+                let (header, main_rows) = parse_formatted_table(&main_res);
+                
+                let col_names: Vec<String> = header.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                let col_idx = col_names.iter().position(|c| c.eq_ignore_ascii_case(&column))
+                    .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", column))?;
+                
+                let mut filtered_rows = Vec::new();
+                for row_str in main_rows {
+                    let vals: Vec<String> = row_str.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                    if vals.len() > col_idx && allowed_values.contains(&vals[col_idx]) {
+                        filtered_rows.push(row_str);
+                    }
+                }
+                
+                let mut output = format!("+-----------------+\n{}\n+-----------------+\n", header);
+                for row in &filtered_rows {
+                    output.push_str(&format!("{}\n", row));
+                }
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", filtered_rows.len()));
+                
+                Ok(output)
+            }
+            Statement::SelectWindow { table_name, partition_by, order_by } => {
+                let main_res = self.execute(Statement::Select { table_name, where_clause: None, order_by: None, limit_offset: None })?;
+                let (header, main_rows) = parse_formatted_table(&main_res);
+                
+                let col_names: Vec<String> = header.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                let part_idx = col_names.iter().position(|c| c.eq_ignore_ascii_case(&partition_by)).unwrap_or(0);
+                let ord_idx = col_names.iter().position(|c| c.eq_ignore_ascii_case(&order_by)).unwrap_or(0);
+                
+                let mut row_objects = Vec::new();
+                for row_str in main_rows {
+                    let vals: Vec<String> = row_str.trim_matches('|').split('|').map(|s| s.trim().to_string()).collect();
+                    row_objects.push(vals);
+                }
+                
+                // sort by partition_by, then order_by
+                row_objects.sort_by(|a, b| {
+                    let pa = a.get(part_idx).unwrap_or(&String::new()).clone();
+                    let pb = b.get(part_idx).unwrap_or(&String::new()).clone();
+                    if pa == pb {
+                        let oa = a.get(ord_idx).unwrap_or(&String::new()).clone();
+                        let ob = b.get(ord_idx).unwrap_or(&String::new()).clone();
+                        // try to parse as numbers
+                        if let (Ok(na), Ok(nb)) = (oa.parse::<f64>(), ob.parse::<f64>()) {
+                            na.partial_cmp(&nb).unwrap()
+                        } else {
+                            oa.cmp(&ob)
+                        }
+                    } else {
+                        pa.cmp(&pb)
+                    }
+                });
+                
+                let mut current_part = String::new();
+                let mut row_num = 1;
+                
+                let mut new_rows = Vec::new();
+                for mut row in row_objects {
+                    let part_val = row.get(part_idx).unwrap_or(&String::new()).clone();
+                    if part_val != current_part {
+                        current_part = part_val;
+                        row_num = 1;
+                    }
+                    row.push(row_num.to_string());
+                    row_num += 1;
+                    new_rows.push(row.join(" | "));
+                }
+                
+                let mut output = format!("+-----------------+\n{} | row_number\n+-----------------+\n", header);
+                for row in &new_rows {
+                    output.push_str(&format!("| {} |\n", row));
+                }
+                output.push_str("+-----------------+\n");
+                output.push_str(&format!("{} row(s) in set.", new_rows.len()));
+                
+                Ok(output)
             }
             Statement::Select {
                 table_name,
@@ -716,9 +893,13 @@ impl<'a> Executor<'a> {
                         )
                     })?;
 
+                let catalog_schema = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)?;
+                let mut is_unique = false;
+                
                 // Validate updated type & constraints if schema exists
-                if let Some(schema) = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)? {
+                if let Some(schema) = &catalog_schema {
                     if let Some(col_def) = schema.columns.get(col_idx) {
+                        is_unique = col_def.is_unique;
                         let parsed_val = Value::parse_str(&value, &col_def.data_type)?;
                         if !col_def.is_nullable && parsed_val.is_null() {
                             return Err(anyhow::anyhow!(
@@ -761,7 +942,7 @@ impl<'a> Executor<'a> {
 
                     row_values[col_idx] = value.clone();
 
-                    self.sec_idx_add_for_column(&t_name, &column, &value, &pk_val)?;
+                    self.sec_idx_add_for_column(&t_name, &column, &value, &pk_val, is_unique)?;
 
                     let internal_key = format!("{}:{}", t_name, pk_val).into_bytes();
                     let updated_bytes = encode_values_mvcc(&row_values, active_tx, 0);
@@ -831,6 +1012,40 @@ impl<'a> Executor<'a> {
                 } else {
                     Ok(format!("Query OK, {} rows deleted.", deleted_count))
                 }
+            }
+            Statement::AlterTableAddColumn { table_name, column_def } => {
+                let (schema_name, t_name) = parse_qualified_table_name(&table_name);
+                let col_def = parse_column_def(&column_def);
+                
+                let mut schema = CatalogManager::get_table_schema(self.db, &schema_name, &t_name)?
+                    .ok_or_else(|| anyhow::anyhow!("Table '{}' does not exist", table_name))?;
+                
+                // Add column to schema
+                schema.columns.push(col_def.clone());
+                CatalogManager::save_table_schema(self.db, &schema)?;
+                
+                // Update table metadata
+                let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let schema_val = col_names.join(",");
+                let schema_key = format!("__schema__:{}", t_name);
+                if self.in_transaction {
+                    self.write_buffer.insert(schema_key.into_bytes(), Some(schema_val.into_bytes()));
+                } else {
+                    self.db.put(schema_key.as_bytes(), schema_val.as_bytes())?;
+                }
+                
+                // If it has UNIQUE constraint, create index
+                if col_def.is_unique {
+                    let idx_meta_key = format!("__index__:{}:idx_{}_{}", t_name, t_name, col_def.name);
+                    let idx_schema_val = format!("{}", col_def.name);
+                    if self.in_transaction {
+                        self.write_buffer.insert(idx_meta_key.into_bytes(), Some(idx_schema_val.into_bytes()));
+                    } else {
+                        self.db.put(idx_meta_key.as_bytes(), idx_schema_val.as_bytes())?;
+                    }
+                }
+                
+                Ok(format!("Query OK, 0 rows affected. Added column '{}' to table '{}'.", col_def.name, table_name))
             }
             Statement::DropTable { table_name } => {
                 let (schema_name, t_name) = parse_qualified_table_name(&table_name);
@@ -916,8 +1131,22 @@ impl<'a> Executor<'a> {
         }
 
         let mut rows = Vec::new();
+        
+        // Fetch schema to know how many columns there should be
+        let (schema_name, t_name_only) = parse_qualified_table_name(table_name);
+        let catalog_schema = CatalogManager::get_table_schema(self.db, &schema_name, &t_name_only)?;
+        
         for (_k, v) in row_map {
-            rows.push(decode_values(&v)?);
+            let mut row = decode_values(&v)?;
+            if let Some(schema) = &catalog_schema {
+                if row.len() < schema.columns.len() {
+                    for col in schema.columns.iter().skip(row.len()) {
+                        let def_val = col.default_value.clone().unwrap_or_else(|| "NULL".to_string());
+                        row.push(def_val);
+                    }
+                }
+            }
+            rows.push(row);
         }
         Ok(rows)
     }
@@ -945,7 +1174,7 @@ impl<'a> Executor<'a> {
 
     // ---- Secondary Index Helpers ----
 
-    fn sec_idx_add(&mut self, table: &str, column: &str, col_val: &str, pk: &str) -> Result<()> {
+    fn sec_idx_add(&mut self, table: &str, column: &str, col_val: &str, pk: &str, is_unique: bool) -> Result<()> {
         let sec_key = format!("__secidx__:{}:{}:{}", table, column, col_val);
         let existing = self.db.get(sec_key.as_bytes())?;
 
@@ -955,6 +1184,9 @@ impl<'a> Executor<'a> {
                 let pks: Vec<&str> = existing_str.split(SEC_IDX_PK_SEP).collect();
                 if pks.contains(&pk) {
                     return Ok(());
+                }
+                if is_unique && !pks.is_empty() {
+                    return Err(anyhow::anyhow!("UNIQUE constraint violation: Duplicate value '{}' in column '{}'", col_val, column));
                 }
                 format!("{}{}{}", existing_str, SEC_IDX_PK_SEP, pk)
             }
@@ -1006,6 +1238,7 @@ impl<'a> Executor<'a> {
         col_names: &[String],
         values: &[String],
         pk: &str,
+        schema: Option<&TableSchema>,
     ) -> Result<()> {
         let idx_prefix = format!("__index__:{}:", table_name);
         let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
@@ -1014,7 +1247,16 @@ impl<'a> Executor<'a> {
             let cols: Vec<&str> = col_names_spec.split(',').collect();
 
             let mut col_vals = Vec::new();
+            let mut is_unique = false;
             for col in &cols {
+                if let Some(schema) = schema {
+                    if let Some((_, col_def)) = schema.find_column(col) {
+                        if col_def.is_unique {
+                            is_unique = true;
+                        }
+                    }
+                }
+                
                 if let Some(col_idx) = col_names.iter().position(|c| c == col) {
                     if col_idx < values.len() {
                         col_vals.push(values[col_idx].clone());
@@ -1025,7 +1267,7 @@ impl<'a> Executor<'a> {
             if col_vals.len() == cols.len() {
                 let composite_val = col_vals.join("+");
                 let column_key = cols.join("+");
-                self.sec_idx_add(table_name, &column_key, &composite_val, pk)?;
+                self.sec_idx_add(table_name, &column_key, &composite_val, pk, is_unique)?;
             }
         }
         Ok(())
@@ -1055,13 +1297,14 @@ impl<'a> Executor<'a> {
         column: &str,
         col_val: &str,
         pk: &str,
+        is_unique: bool,
     ) -> Result<()> {
         let idx_prefix = format!("__index__:{}:", table_name);
         let indices = self.db.scan_prefix(idx_prefix.as_bytes())?;
         for (_idx_key, col_val_bytes) in indices {
             let indexed_col = String::from_utf8_lossy(&col_val_bytes).to_string();
             if indexed_col == column {
-                self.sec_idx_add(table_name, column, col_val, pk)?;
+                self.sec_idx_add(table_name, column, col_val, pk, is_unique)?;
             }
         }
         Ok(())
@@ -1106,14 +1349,35 @@ fn parse_column_def(raw: &str) -> ColumnDef {
     let mut dtype = DataType::Text;
     let mut is_nullable = true;
     let mut is_pk = false;
+    let mut is_unique = false;
+    let mut default_val = None;
 
     let upper_raw = raw.to_uppercase();
     if upper_raw.contains("PRIMARY KEY") {
         is_pk = true;
         is_nullable = false;
+        is_unique = true; // PK implies UNIQUE
+    }
+    if upper_raw.contains("UNIQUE") {
+        is_unique = true;
     }
     if upper_raw.contains("NOT NULL") {
         is_nullable = false;
+    }
+    
+    if let Some(def_idx) = upper_raw.find("DEFAULT") {
+        let rest = raw[def_idx + 7..].trim();
+        // naive extraction: split by space and take the first token unless it is quoted
+        if rest.starts_with('\'') {
+            if let Some(end_quote) = rest[1..].find('\'') {
+                default_val = Some(rest[1..end_quote + 1].to_string());
+            }
+        } else {
+            let def_token = rest.split_whitespace().next().unwrap_or("");
+            if !def_token.is_empty() {
+                default_val = Some(def_token.to_string());
+            }
+        }
     }
 
     if tokens.len() > 1 {
@@ -1123,9 +1387,18 @@ fn parse_column_def(raw: &str) -> ColumnDef {
         }
     }
 
-    ColumnDef::new(col_name, dtype)
+    let mut col_def = ColumnDef::new(col_name, dtype)
         .with_nullable(is_nullable)
         .with_primary_key(is_pk)
+        .with_unique(is_unique);
+        
+    // Inject the is_unique field conceptually through an implicit index (we can just handle it at CreateTable time).
+    // Let's add default value to the struct.
+    col_def.default_value = default_val;
+    
+    // We don't have is_unique on ColumnDef yet, let's just modify types.rs to add it if needed, or handle it here?
+    // Actually, I can just create indexes for UNIQUE columns inside `CreateTable`.
+    col_def
 }
 
 fn parse_qualified_table_name(raw: &str) -> (String, String) {
@@ -1203,4 +1476,15 @@ mod tests {
         assert!(res.contains("25"));
         assert!(!res.contains("20"));
     }
+}
+
+fn parse_formatted_table(table: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = table.lines().collect();
+    if lines.len() < 5 { return (String::new(), vec![]); }
+    let header = lines[1].to_string();
+    let mut rows = Vec::new();
+    for i in 3..lines.len() - 2 {
+        rows.push(lines[i].to_string());
+    }
+    (header, rows)
 }

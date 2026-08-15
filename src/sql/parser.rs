@@ -21,6 +21,16 @@ pub enum Statement {
         table_name: String,
         columns: Vec<String>,
     },
+    Union {
+        left: Box<Statement>,
+        right: Box<Statement>,
+        all: bool,
+    },
+    With {
+        cte_name: String,
+        cte_query: Box<Statement>,
+        main_query: Box<Statement>,
+    },
     Insert {
         table_name: String,
         values_list: Vec<Vec<String>>,
@@ -30,6 +40,16 @@ pub enum Statement {
         where_clause: Option<(String, String)>,
         order_by: Option<(String, bool)>,       // (col_name, is_desc)
         limit_offset: Option<(usize, usize)>,  // (limit, offset)
+    },
+    SelectInSubquery {
+        table_name: String,
+        column: String,
+        subquery: Box<Statement>,
+    },
+    SelectWindow {
+        table_name: String,
+        partition_by: String,
+        order_by: String,
     },
     SelectRange {
         table_name: String,
@@ -71,6 +91,10 @@ pub enum Statement {
     DropTable {
         table_name: String,
     },
+    AlterTableAddColumn {
+        table_name: String,
+        column_def: String,
+    },
     ShowTables,
     ShowSchemas,
     Begin,
@@ -84,6 +108,49 @@ impl Parser {
     pub fn parse(sql: &str) -> Result<Statement> {
         let sql = sql.trim().trim_end_matches(';');
         let upper_sql = sql.to_uppercase();
+
+        if upper_sql.starts_with("WITH ") {
+            let as_idx = upper_sql.find(" AS ").ok_or_else(|| anyhow::anyhow!("Syntax Error: Missing AS in WITH"))?;
+            let cte_name = sql[5..as_idx].trim().to_string();
+            
+            let paren_open = upper_sql[as_idx..].find('(').ok_or_else(|| anyhow::anyhow!("Syntax Error: Missing ( in WITH"))?;
+            let paren_open_idx = as_idx + paren_open;
+            
+            let mut parens = 0;
+            let mut paren_close_idx = 0;
+            for (i, c) in sql[paren_open_idx..].char_indices() {
+                if c == '(' { parens += 1; }
+                else if c == ')' { parens -= 1; }
+                if parens == 0 {
+                    paren_close_idx = paren_open_idx + i;
+                    break;
+                }
+            }
+            
+            let cte_query = sql[paren_open_idx + 1..paren_close_idx].trim();
+            let main_query = sql[paren_close_idx + 1..].trim();
+            
+            return Ok(Statement::With {
+                cte_name,
+                cte_query: Box::new(Self::parse(cte_query)?),
+                main_query: Box::new(Self::parse(main_query)?),
+            });
+        }
+        
+        if let Some(union_idx) = upper_sql.find(" UNION ") {
+            let left_sql = sql[..union_idx].trim();
+            let mut right_sql = sql[union_idx + 7..].trim();
+            let mut all = false;
+            if right_sql.to_uppercase().starts_with("ALL ") {
+                all = true;
+                right_sql = right_sql[4..].trim();
+            }
+            return Ok(Statement::Union {
+                left: Box::new(Self::parse(left_sql)?),
+                right: Box::new(Self::parse(right_sql)?),
+                all,
+            });
+        }
 
         if upper_sql.starts_with("CREATE USER") {
             Self::parse_create_user(sql)
@@ -101,6 +168,8 @@ impl Parser {
             Self::parse_update(sql)
         } else if upper_sql.starts_with("DELETE FROM") {
             Self::parse_delete(sql)
+        } else if upper_sql.starts_with("ALTER TABLE") {
+            Self::parse_alter_table(sql)
         } else if upper_sql.starts_with("DROP TABLE") {
             Self::parse_drop_table(sql)
         } else if upper_sql == "SHOW TABLES" {
@@ -131,6 +200,38 @@ impl Parser {
             return Err(anyhow!("Identifier cannot be empty"));
         }
         Ok(())
+    }
+
+
+
+    fn parse_alter_table(sql: &str) -> Result<Statement> {
+        let upper_sql = sql.to_uppercase();
+        if !upper_sql.starts_with("ALTER TABLE ") {
+            return Err(anyhow!("Syntax Error: Expected ALTER TABLE"));
+        }
+
+        let rest = sql[12..].trim();
+        let mut tokens = rest.splitn(2, ' ');
+        let table_name = tokens.next().unwrap_or("").to_string();
+        
+        let remaining = tokens.next().unwrap_or("").trim();
+        let upper_remaining = remaining.to_uppercase();
+        
+        if upper_remaining.starts_with("ADD COLUMN ") {
+            let column_def = remaining[11..].trim().to_string();
+            return Ok(Statement::AlterTableAddColumn {
+                table_name,
+                column_def,
+            });
+        } else if upper_remaining.starts_with("ADD ") {
+            let column_def = remaining[4..].trim().to_string();
+            return Ok(Statement::AlterTableAddColumn {
+                table_name,
+                column_def,
+            });
+        }
+        
+        Err(anyhow!("Syntax Error: Unsupported ALTER TABLE operation"))
     }
 
     fn parse_create_user(sql: &str) -> Result<Statement> {
@@ -341,6 +442,35 @@ impl Parser {
 
         let upper_target = target.to_uppercase();
 
+        if upper_target.starts_with("ROW_NUMBER() OVER") {
+            let over_idx = upper_target.find("OVER").unwrap();
+            let paren_start = upper_target[over_idx..].find('(').unwrap() + over_idx;
+            let paren_end = upper_target[paren_start..].rfind(')').unwrap() + paren_start;
+            let over_clause = upper_target[paren_start + 1..paren_end].trim();
+            
+            let mut part_by = String::new();
+            let mut ord_by = String::new();
+            
+            if let Some(part_idx) = over_clause.find("PARTITION BY ") {
+                if let Some(ord_idx) = over_clause.find("ORDER BY ") {
+                    part_by = over_clause[part_idx + 13..ord_idx].trim().to_string();
+                    ord_by = over_clause[ord_idx + 9..].trim().to_string();
+                } else {
+                    part_by = over_clause[part_idx + 13..].trim().to_string();
+                }
+            } else if let Some(ord_idx) = over_clause.find("ORDER BY ") {
+                ord_by = over_clause[ord_idx + 9..].trim().to_string();
+            }
+            
+            let table_name = rest.trim().to_string();
+            
+            return Ok(Statement::SelectWindow {
+                table_name,
+                partition_by: part_by,
+                order_by: ord_by,
+            });
+        }
+
         if upper_target.starts_with("COUNT(")
             || upper_target.starts_with("SUM(")
             || upper_target.starts_with("AVG(")
@@ -389,6 +519,16 @@ impl Parser {
             }
 
             let wc = parse_where_equality(cond)?;
+            let upper_val = wc.1.to_uppercase();
+            if upper_val.starts_with("IN (SELECT") && upper_val.ends_with(')') {
+                let inner = wc.1[4..wc.1.len() - 1].trim();
+                return Ok(Statement::SelectInSubquery {
+                    table_name,
+                    column: wc.0,
+                    subquery: Box::new(Self::parse(inner)?),
+                });
+            }
+            
             Ok(Statement::Select {
                 table_name,
                 where_clause: Some(wc),
@@ -588,6 +728,12 @@ fn parse_assignment(expr: &str) -> Result<(String, String)> {
 }
 
 fn parse_where_equality(cond: &str) -> Result<(String, String)> {
+    let upper = cond.to_uppercase();
+    if let Some(in_idx) = upper.find(" IN ") {
+        let col = cond[..in_idx].trim().to_string();
+        let val = cond[in_idx..].trim().to_string();
+        return Ok((col, val));
+    }
     parse_assignment(cond)
 }
 

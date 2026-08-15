@@ -19,7 +19,7 @@ fn test_create_table_and_insert() {
     let mut exec = Executor::new(&mut db);
 
     // 1. Create table
-    let stmt = Parser::parse("CREATE TABLE users(id INT, name TEXT)").unwrap();
+    let stmt = Parser::parse("CREATE TABLE users(id INT, name TEXT NOT NULL)").unwrap();
     assert!(exec.execute(stmt).is_ok());
 
     // 2. Insert into non-existent table fails
@@ -207,7 +207,94 @@ fn test_update_and_delete() {
     let select_res_2 = exec.execute(Parser::parse("SELECT * FROM ud").unwrap()).unwrap();
     assert!(!select_res_2.contains("Bob"));
     
-    // Delete without where
     let res_del_all = exec.execute(Parser::parse("DELETE FROM ud").unwrap()).unwrap();
     assert!(res_del_all.contains("2 rows deleted"));
+}
+
+#[test]
+fn test_unique_and_default() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE ud(id INT PRIMARY KEY, name TEXT UNIQUE, age INT DEFAULT 18)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO ud VALUES(1, 'Alice')").unwrap()).unwrap();
+
+    // Missing column `age` should be padded with 18
+    let res = exec.execute(Parser::parse("SELECT * FROM ud WHERE id = 1").unwrap()).unwrap();
+    assert!(res.contains("18"));
+
+    // Duplicate name should fail UNIQUE constraint
+    let err = exec.execute(Parser::parse("INSERT INTO ud VALUES(2, 'Alice')").unwrap());
+    assert!(err.is_err());
+    let err_msg = err.unwrap_err().to_string();
+    assert!(err_msg.contains("UNIQUE constraint violation"));
+    
+    // Duplicate ID should fail PRIMARY KEY unique constraint
+    let err2 = exec.execute(Parser::parse("INSERT INTO ud VALUES(1, 'Bob')").unwrap());
+    assert!(err2.is_err());
+    let err_msg2 = err2.unwrap_err().to_string();
+    assert!(err_msg2.contains("UNIQUE constraint violation"));
+}
+
+#[test]
+fn test_alter_table_add_column() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE at(id INT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO at VALUES(1)").unwrap()).unwrap();
+
+    let res1 = exec.execute(Parser::parse("SELECT * FROM at").unwrap()).unwrap();
+    assert!(res1.contains("1"));
+
+    // Alter table
+    exec.execute(Parser::parse("ALTER TABLE at ADD COLUMN name TEXT DEFAULT 'Anonymous'").unwrap()).unwrap();
+
+    // Query old row, should have 'Anonymous'
+    let res2 = exec.execute(Parser::parse("SELECT * FROM at").unwrap()).unwrap();
+    assert!(res2.contains("Anonymous"));
+
+    // Insert new row
+    exec.execute(Parser::parse("INSERT INTO at VALUES(2, 'Bob')").unwrap()).unwrap();
+    let res3 = exec.execute(Parser::parse("SELECT * FROM at WHERE id = 2").unwrap()).unwrap();
+    assert!(res3.contains("Bob"));
+}
+
+#[test]
+fn test_advanced_sql() {
+    let dir = tempdir().unwrap();
+    let (mut db, _) = setup_executor(&dir);
+    let mut exec = Executor::new(&mut db);
+
+    exec.execute(Parser::parse("CREATE TABLE t1(id INT, name TEXT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO t1 VALUES(1, 'A')").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO t1 VALUES(2, 'B')").unwrap()).unwrap();
+    
+    exec.execute(Parser::parse("CREATE TABLE t2(id INT, name TEXT)").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO t2 VALUES(2, 'B')").unwrap()).unwrap();
+    exec.execute(Parser::parse("INSERT INTO t2 VALUES(3, 'C')").unwrap()).unwrap();
+
+    // UNION
+    let res_union = exec.execute(Parser::parse("SELECT * FROM t1 UNION SELECT * FROM t2").unwrap()).unwrap();
+    assert!(res_union.contains("3 row(s)")); // A, B, C (no duplicates)
+    
+    // UNION ALL
+    let res_union_all = exec.execute(Parser::parse("SELECT * FROM t1 UNION ALL SELECT * FROM t2").unwrap()).unwrap();
+    assert!(res_union_all.contains("4 row(s)")); // A, B, B, C
+    
+    // SUBQUERY
+    let res_subq = exec.execute(Parser::parse("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)").unwrap()).unwrap();
+    assert!(res_subq.contains("1 row(s)")); // Only 2, 'B'
+    
+    // CTE
+    let res_cte = exec.execute(Parser::parse("WITH temp AS (SELECT * FROM t1) SELECT * FROM temp").unwrap()).unwrap();
+    assert!(res_cte.contains("2 row(s)")); // 1, 'A' and 2, 'B'
+    
+    // WINDOW FUNCTION
+    exec.execute(Parser::parse("INSERT INTO t1 VALUES(3, 'A')").unwrap()).unwrap();
+    let res_win = exec.execute(Parser::parse("SELECT ROW_NUMBER() OVER(PARTITION BY name ORDER BY id) FROM t1").unwrap()).unwrap();
+    assert!(res_win.contains("3 row(s)"));
+    assert!(res_win.contains("row_number"));
 }

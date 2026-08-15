@@ -10,7 +10,7 @@
 
 **Project Status:** Experimental / Alpha. Not recommended for production use.
 
-## What's New in v0.4.5
+## What's New in v0.4.6
 MagnumDB is an open-source educational database internals project. It provides:
 - An embedded key-value storage engine (B+ tree, WAL).
 - A basic relational SQL query execution engine (Volcano-style).
@@ -51,9 +51,9 @@ MagnumDB exposes a basic heuristic, rule-based SQL planner and Volcano-style exe
 | `UPDATE` | ✅ | Supports single-column update with optional `WHERE` filtering. |
 | `DELETE` | ✅ | Supports deletion with optional `WHERE` filtering. |
 | `DROP TABLE` | ✅ | Drops table and its associated indexes from storage catalog. |
-| **Unsupported DDL** | ❌ | `ALTER TABLE`, `CREATE INDEX`. (Internally, tables are clustered on an implicit 64-bit row ID, but secondary SQL indexes do not exist). |
-| **Unsupported Constraints**| ❌ | `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `DEFAULT`. `NOT NULL` is parsed but not strictly enforced in all executor paths. |
-| **Unsupported SQL** | ❌ | Subqueries, CTEs, Window Functions, `UNION`. |
+| `ALTER TABLE` | ✅ | Supports `ADD COLUMN`. |
+| **Constraints**| ✅ | `UNIQUE`, `DEFAULT`, and `NOT NULL` are now strictly enforced. (Note: `PRIMARY KEY` and `FOREIGN KEY` are parsed but defer to `UNIQUE` indexing logic). |
+| **Advanced SQL** | ✅ | Subqueries (`IN (SELECT...)`), CTEs (`WITH`), Window Functions (`ROW_NUMBER() OVER(...)`), and `UNION` / `UNION ALL`. |
 
 ---
 

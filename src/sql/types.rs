@@ -172,6 +172,7 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub is_nullable: bool,
     pub is_primary_key: bool,
+    pub is_unique: bool,
     pub default_value: Option<String>,
 }
 
@@ -182,6 +183,7 @@ impl ColumnDef {
             data_type,
             is_nullable: true,
             is_primary_key: false,
+            is_unique: false,
             default_value: None,
         }
     }
@@ -195,7 +197,13 @@ impl ColumnDef {
         self.is_primary_key = primary_key;
         if primary_key {
             self.is_nullable = false;
+            self.is_unique = true;
         }
+        self
+    }
+    
+    pub fn with_unique(mut self, unique: bool) -> Self {
+        self.is_unique = unique;
         self
     }
 }
