@@ -2,6 +2,13 @@ use crate::sql::types::{ColumnDef, DataType, TableSchema};
 use crate::storage::Database;
 use anyhow::{anyhow, Result};
 use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UserInfo {
+    pub password_hash: Option<String>,
+    pub is_superuser: bool,
+}
 
 pub const DEFAULT_SCHEMA: &str = "public";
 
@@ -23,12 +30,29 @@ impl CatalogManager {
         )
     }
 
+    /// Formats catalog key for user metadata storage.
+    pub fn user_key(username: &str) -> String {
+        format!("__catalog__:user:{}", username.to_lowercase())
+    }
+
     /// Ensures the default 'public' schema exists in the database catalog.
     pub fn init_default_schema(db: &Database) -> Result<()> {
         let key = Self::schema_key(DEFAULT_SCHEMA);
         if db.get(key.as_bytes())?.is_none() {
             db.put(key.as_bytes(), b"registered")?;
         }
+
+        // Bootstrap default 'postgres' superuser
+        let pg_user_key = Self::user_key("postgres");
+        if db.get(pg_user_key.as_bytes())?.is_none() {
+            let info = UserInfo {
+                password_hash: None, // No password by default for initial bootstrap
+                is_superuser: true,
+            };
+            let serialized = serde_json::to_vec(&info)?;
+            db.put(pg_user_key.as_bytes(), &serialized)?;
+        }
+
         Ok(())
     }
 
@@ -40,6 +64,37 @@ impl CatalogManager {
         }
         db.put(key.as_bytes(), b"registered")?;
         Ok(())
+    }
+
+    /// Creates a new user in the catalog.
+    pub fn create_user(
+        db: &Database,
+        username: &str,
+        password_hash: Option<String>,
+        is_superuser: bool,
+    ) -> Result<()> {
+        let key = Self::user_key(username);
+        if db.get(key.as_bytes())?.is_some() {
+            return Err(anyhow!("Role '{}' already exists", username));
+        }
+        let info = UserInfo {
+            password_hash,
+            is_superuser,
+        };
+        let serialized = serde_json::to_vec(&info)?;
+        db.put(key.as_bytes(), &serialized)?;
+        Ok(())
+    }
+
+    /// Retrieves user metadata from the catalog.
+    pub fn get_user(db: &Database, username: &str) -> Result<Option<UserInfo>> {
+        let key = Self::user_key(username);
+        if let Some(bytes) = db.get(key.as_bytes())? {
+            let info: UserInfo = serde_json::from_slice(&bytes)?;
+            Ok(Some(info))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Lists all registered schema namespaces in the database.

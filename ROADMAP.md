@@ -29,8 +29,8 @@ This document outlines the roadmap and current completion state for MagnumDB.
 ## Phase 4: Concurrency & Transactions
 - [x] Write-Ahead Log Transaction Framing (`BEGIN`, `COMMIT`, `ROLLBACK`)
 - [x] Single-Writer WAL Transaction Durability
-- [ ] Multi-Version Concurrency Control (MVCC tuple headers)
-- [ ] Fine-Grained Page Latching (`RwLock<Page>`)
+- [x] Multi-Version Concurrency Control (MVCC tuple headers)
+- [x] Fine-Grained Page Latching (`RwLock<Page>`)
 
 ## Phase 5: Client-Server Architecture
 - [x] Async Multi-Client TCP Server (Tokio runtime)

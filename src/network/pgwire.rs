@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use rand::Rng;
 
 pub struct PgWireHandler {
     db: Arc<Database>,
@@ -32,7 +32,8 @@ impl PgWireHandler {
         let mut body = vec![0u8; msg_len - 4];
         socket.read_exact(&mut body).await?;
 
-        let code = i32::from_be_bytes(body[0..4].try_into().unwrap_or([0; 4]));
+        let mut startup_payload = body;
+        let code = i32::from_be_bytes(startup_payload[0..4].try_into().unwrap_or([0; 4]));
 
         if code == 80877103 {
             // SSL Request -> Respond 'N' (SSL not supported, fallback to plain TCP)
@@ -43,8 +44,48 @@ impl PgWireHandler {
                 return Ok(());
             }
             let startup_len = i32::from_be_bytes(len_buf) as usize;
-            let mut startup_body = vec![0u8; startup_len - 4];
-            socket.read_exact(&mut startup_body).await?;
+            startup_payload = vec![0u8; startup_len - 4];
+            socket.read_exact(&mut startup_payload).await?;
+        }
+
+        let params = Self::parse_startup_message(&startup_payload);
+        let username = params.get("user").cloned().unwrap_or_else(|| "postgres".to_string());
+
+        // Check catalog for user
+        if let Some(user_info) = crate::sql::catalog::CatalogManager::get_user(&self.db, &username)? {
+            if let Some(expected_hash) = user_info.password_hash {
+                // Send AuthenticationMD5Password (code 5)
+                let salt: [u8; 4] = rand::thread_rng().gen();
+                let mut auth_md5 = vec![b'R', 0, 0, 0, 12, 0, 0, 0, 5];
+                auth_md5.extend_from_slice(&salt);
+                socket.write_all(&auth_md5).await?;
+
+                // Wait for PasswordMessage ('p')
+                let mut p_tag = [0u8; 1];
+                if socket.read_exact(&mut p_tag).await.is_err() || p_tag[0] != b'p' {
+                    let _ = Self::send_error_response(&mut socket, "FATAL: Expected password message").await;
+                    return Ok(());
+                }
+                if socket.read_exact(&mut len_buf).await.is_err() { return Ok(()); }
+                let p_len = i32::from_be_bytes(len_buf) as usize;
+                let mut p_body = vec![0u8; p_len - 4];
+                socket.read_exact(&mut p_body).await?;
+                
+                let client_hash = String::from_utf8_lossy(&p_body[..p_body.len().saturating_sub(1)]).to_string();
+                let raw_hash = expected_hash.strip_prefix("md5").unwrap_or(&expected_hash);
+                
+                let combined = format!("{}{}", raw_hash, String::from_utf8_lossy(&salt));
+                let digest = md5::compute(combined);
+                let server_hash = format!("md5{:x}", digest);
+                
+                if client_hash != server_hash {
+                    let _ = Self::send_error_response(&mut socket, "FATAL: password authentication failed").await;
+                    return Ok(());
+                }
+            }
+        } else {
+            let _ = Self::send_error_response(&mut socket, "FATAL: role does not exist").await;
+            return Ok(());
         }
 
         // Send AuthenticationOk: 'R' [0,0,0,8] [0,0,0,0]
@@ -242,6 +283,28 @@ impl PgWireHandler {
         msg.extend_from_slice(&body);
         socket.write_all(&msg).await?;
         Ok(())
+    }
+
+    fn parse_startup_message(body: &[u8]) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        if body.len() < 4 {
+            return params;
+        }
+        let mut offset = 4; // skip protocol version
+        while offset < body.len() {
+            let key_end = body[offset..].iter().position(|&b| b == 0).unwrap_or(0);
+            if key_end == 0 { break; }
+            let key = String::from_utf8_lossy(&body[offset..offset + key_end]).to_string();
+            offset += key_end + 1;
+            
+            if offset >= body.len() { break; }
+            let val_end = body[offset..].iter().position(|&b| b == 0).unwrap_or(0);
+            let val = String::from_utf8_lossy(&body[offset..offset + val_end]).to_string();
+            offset += val_end + 1;
+            
+            params.insert(key, val);
+        }
+        params
     }
 }
 

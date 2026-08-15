@@ -95,6 +95,14 @@ impl<'a> Executor<'a> {
 
     pub fn execute(&mut self, stmt: Statement) -> Result<String> {
         match stmt {
+            Statement::CreateUser { username, password } => {
+                let pwd_hash = password.map(|p| {
+                    let digest = md5::compute(format!("{}{}", p, username));
+                    format!("md5{:x}", digest)
+                });
+                crate::sql::catalog::CatalogManager::create_user(self.db, &username, pwd_hash, false)?;
+                Ok(format!("Query OK, user '{}' created.", username))
+            }
             Statement::Begin => {
                 if self.in_transaction {
                     return Err(anyhow::anyhow!("Transaction already in progress"));

@@ -5,6 +5,10 @@ const RESERVED_PREFIX: &str = "__";
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Statement {
+    CreateUser {
+        username: String,
+        password: Option<String>,
+    },
     CreateSchema {
         schema_name: String,
     },
@@ -81,7 +85,9 @@ impl Parser {
         let sql = sql.trim().trim_end_matches(';');
         let upper_sql = sql.to_uppercase();
 
-        if upper_sql.starts_with("CREATE SCHEMA") {
+        if upper_sql.starts_with("CREATE USER") {
+            Self::parse_create_user(sql)
+        } else if upper_sql.starts_with("CREATE SCHEMA") {
             Self::parse_create_schema(sql)
         } else if upper_sql.starts_with("CREATE INDEX") {
             Self::parse_create_index(sql)
@@ -125,6 +131,22 @@ impl Parser {
             return Err(anyhow!("Identifier cannot be empty"));
         }
         Ok(())
+    }
+
+    fn parse_create_user(sql: &str) -> Result<Statement> {
+        let tokens: Vec<&str> = sql.split_whitespace().collect();
+        if tokens.len() < 3 {
+            return Err(anyhow!("Syntax error in CREATE USER"));
+        }
+        let username = tokens[2].to_string();
+        Self::validate_identifier(&username)?;
+
+        let mut password = None;
+        if tokens.len() >= 6 && tokens[3].to_uppercase() == "WITH" && tokens[4].to_uppercase() == "PASSWORD" {
+            password = Some(tokens[5].trim_matches('\'').to_string());
+        }
+
+        Ok(Statement::CreateUser { username, password })
     }
 
     fn parse_create_schema(sql: &str) -> Result<Statement> {
@@ -562,6 +584,29 @@ mod tests {
                 where_clause: None,
                 order_by: Some(("age".to_string(), true)),
                 limit_offset: Some((10, 5)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_create_user() {
+        let sql = "CREATE USER bob WITH PASSWORD 'secret123';";
+        let stmt = Parser::parse(sql).unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateUser {
+                username: "bob".to_string(),
+                password: Some("secret123".to_string()),
+            }
+        );
+
+        let sql2 = "CREATE USER alice;";
+        let stmt2 = Parser::parse(sql2).unwrap();
+        assert_eq!(
+            stmt2,
+            Statement::CreateUser {
+                username: "alice".to_string(),
+                password: None,
             }
         );
     }
