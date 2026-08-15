@@ -16,15 +16,16 @@ This document outlines the roadmap and current completion state for MagnumDB.
 - [x] B+ Tree Index (Fixed 4KB Page Serialization)
 - [x] Prefix Range Scanning (`scan_prefix`)
 - [x] Overflow Page Chaining for Large Records (> 4KB)
-- [x] Secondary Indexing (`CREATE INDEX`)
+- [ ] Secondary Indexing (`CREATE INDEX`)
 - [x] LRU Buffer Pool Page Manager
 
 ## Phase 3: SQL Interface & Query Engine
 - [x] SQL Parser (DDL, DML, Range Queries, Aggregates)
 - [x] Volcano Streaming Execution Iterator Engine (`SeqScanExec`, `FilterExec`, `AggregateExec`)
-- [x] Supported Commands: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `DROP TABLE`, `SHOW TABLES`
+- [x] Supported Commands: `CREATE TABLE`, `INSERT`, `SELECT`, `SHOW TABLES`
+- [ ] Unsupported Commands (Planned): `UPDATE`, `DELETE`, `DROP TABLE`, `CREATE INDEX`
 - [x] Aggregate Functions: `COUNT(*)`, `SUM(col)`, `AVG(col)`
-- [x] Cost-Based Query Optimizer (CBO strategy selection)
+- [ ] Cost-Based Query Optimizer (CBO strategy selection)
 
 ## Phase 4: Concurrency & Transactions
 - [x] Write-Ahead Log Transaction Framing (`BEGIN`, `COMMIT`, `ROLLBACK`)

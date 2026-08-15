@@ -101,7 +101,7 @@ impl<'a> Executor<'a> {
                     format!("md5{:x}", digest)
                 });
                 crate::sql::catalog::CatalogManager::create_user(self.db, &username, pwd_hash, false)?;
-                Ok(format!("Query OK, user '{}' created.", username))
+                Ok(format!("CREATE ROLE"))
             }
             Statement::Begin => {
                 if self.in_transaction {
