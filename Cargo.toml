@@ -1,6 +1,6 @@
 [package]
 name = "magnumdb"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 authors = ["Soham Das <sohom2682009@gmail.com>"]
 description = "High-performance embeddable database engine in Rust with B+ Tree storage, WAL durability, Volcano query engine, and Postgres wire protocol support."
